@@ -9,6 +9,18 @@
     <AssemblyName>PoEWatchdog</AssemblyName>
     <!-- Kein separates Program.cs nötig – Entry Point ist in MainForm.cs -->
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+
+    <!-- ─ Single-File Publish: eine einzige .exe ohne separate DLLs ─ -->
+    <!-- Wirkt nur bei "Publish" / "dotnet publish", nicht bei normalem Build! -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <PublishReadyToRun>false</PublishReadyToRun>
+    <!-- Keine zusätzliche .pdb neben der exe veröffentlichen -->
+    <DebugType>none</DebugType>
   </PropertyGroup>
 
   <ItemGroup>

@@ -6,22 +6,24 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
+using System.Linq;
 using System.Net.NetworkInformation;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using Microsoft.Win32;
 using Renci.SshNet;
 
 [STAThread]
-static void AppMain()
+static void AppMain(string[] args)
 {
     Application.EnableVisualStyles();
     Application.SetCompatibleTextRenderingDefault(false);
-    Application.Run(new MainForm());
+    Application.Run(new MainForm(Array.IndexOf(args, "--autostart") >= 0));
 }
-AppMain();
+AppMain(Environment.GetCommandLineArgs()[1..]);
 
 // ═════════════════════════════════════════════════════════════════════════════
 public class MainForm : Form
@@ -36,12 +38,46 @@ public class MainForm : Form
     private NumericUpDown   numRetries    = new();
     private NumericUpDown   numPoEOff     = new();
     private CheckBox        chkSavePass   = new();
+    private CheckBox        chkAutoStartWin       = new();
+    private CheckBox        chkAutoStartWatchdog  = new();
+
+    // ── Tray ──────────────────────────────────────────────────────────────────
+    private NotifyIcon         trayIcon = new();
+    private ContextMenuStrip   trayMenu = new();
+    private ToolStripMenuItem  trayToggleItem = new();
+    private bool               _exitRequested  = false;
+    private readonly bool      _startedMinimized;
+
+    const string AutoStartRegKey  = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    const string AutoStartValName = "PoEWatchdog";
 
     // ── Persistenz ────────────────────────────────────────────────────────────
     static readonly string SettingsDir  = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PoEWatchdog");
     static readonly string SettingsPath = Path.Combine(SettingsDir, "settings.json");
-    static readonly string LogPath      = Path.Combine(SettingsDir, "poewatchdog.log");
+    static readonly string LogDir       = Path.Combine(SettingsDir, "logs");
+    const long   MaxLogFileBytes  = 2 * 1024 * 1024; // 2 MB pro Datei
+    const int    LogRetentionDays = 30;               // ältere Dateien automatisch löschen
+
+    // Aktuelle Log-Datei: ein Name pro Tag, bei Überschreiten von MaxLogFileBytes
+    // wird automatisch _2, _3, ... angehängt (Größen-Rotation innerhalb des Tages).
+    static string LogPath
+    {
+        get
+        {
+            Directory.CreateDirectory(LogDir);
+            string baseDate = DateTime.Now.ToString("yyyy-MM-dd");
+            string path = Path.Combine(LogDir, $"poewatchdog_{baseDate}.log");
+
+            int part = 1;
+            while (File.Exists(path) && new FileInfo(path).Length >= MaxLogFileBytes)
+            {
+                part++;
+                path = Path.Combine(LogDir, $"poewatchdog_{baseDate}_{part}.log");
+            }
+            return path;
+        }
+    }
     static readonly object LogFileLock  = new();
 
     // ── Buttons & Log ─────────────────────────────────────────────────────────
@@ -58,11 +94,101 @@ public class MainForm : Form
     private Color _dotColor   = Color.Gray;
 
     // ═════════════════════════════════════════════════════════════════════════
-    public MainForm()
+    public MainForm(bool startedMinimized = false)
     {
+        _startedMinimized = startedMinimized;
         BuildUI();
+        BuildTray();
         LoadSettings();
-        FormClosing += (_, _) => SaveSettings();
+
+        FormClosing += MainForm_FormClosing;
+        Resize       += MainForm_Resize;
+        Load         += MainForm_Load;
+    }
+
+    void MainForm_Load(object? sender, EventArgs e)
+    {
+        if (_startedMinimized)
+        {
+            Hide();
+            ShowInTaskbar = false;
+        }
+
+        if (chkAutoStartWatchdog.Checked)
+        {
+            if (string.IsNullOrWhiteSpace(txtMonitorIP.Text) ||
+                string.IsNullOrWhiteSpace(txtSwitchIP.Text)  ||
+                string.IsNullOrWhiteSpace(txtUser.Text)      ||
+                string.IsNullOrWhiteSpace(txtPoEPort.Text))
+            {
+                Log("Automatischer Start übersprungen – Konfiguration unvollständig.", Level.Warn);
+            }
+            else
+            {
+                Log("Automatischer Start des Watchdogs (Einstellung aktiv) …", Level.Info);
+                OnStart(this, EventArgs.Empty);
+            }
+        }
+    }
+
+    void MainForm_Resize(object? sender, EventArgs e)
+    {
+        if (WindowState == FormWindowState.Minimized)
+        {
+            Hide();
+            ShowInTaskbar = false;
+        }
+    }
+
+    void MainForm_FormClosing(object? sender, FormClosingEventArgs e)
+    {
+        if (!_exitRequested)
+        {
+            // Klick auf "X" → in den Tray legen statt beenden
+            e.Cancel = true;
+            Hide();
+            ShowInTaskbar = false;
+            trayIcon.ShowBalloonTip(1500, "PoE Watchdog",
+                _cts != null ? "Läuft im Hintergrund weiter." : "In den Tray gelegt.", ToolTipIcon.Info);
+            return;
+        }
+
+        SaveSettings();
+        trayIcon.Visible = false;
+    }
+
+    void BuildTray()
+    {
+        trayToggleItem.Text  = "Öffnen";
+        trayToggleItem.Click += (_, _) => ShowFromTray();
+
+        var itemStart = new ToolStripMenuItem("Watchdog starten");
+        itemStart.Click += (_, _) => { if (btnStart.Enabled) OnStart(this, EventArgs.Empty); };
+
+        var itemStop = new ToolStripMenuItem("Watchdog stoppen");
+        itemStop.Click += (_, _) => OnStop(this, EventArgs.Empty);
+
+        var itemExit = new ToolStripMenuItem("Beenden");
+        itemExit.Click += (_, _) => { _exitRequested = true; Close(); };
+
+        trayMenu.Items.AddRange(new ToolStripItem[] {
+            trayToggleItem, new ToolStripSeparator(), itemStart, itemStop,
+            new ToolStripSeparator(), itemExit
+        });
+
+        trayIcon.Text          = "Huawei PoE Watchdog";
+        trayIcon.Icon          = SystemIcons.Shield;
+        trayIcon.ContextMenuStrip = trayMenu;
+        trayIcon.Visible       = true;
+        trayIcon.DoubleClick  += (_, _) => ShowFromTray();
+    }
+
+    void ShowFromTray()
+    {
+        Show();
+        ShowInTaskbar = true;
+        WindowState   = FormWindowState.Normal;
+        Activate();
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -161,17 +287,31 @@ public class MainForm : Form
         ctrl.Controls.AddRange(new Control[] { btnStart, btnStop });
 
         // Info-Box
-        var info = MakePanel(10, 162, 296, 136, Color.FromArgb(25, 25, 25));
+        var info = MakePanel(10, 162, 296, 92, Color.FromArgb(25, 25, 25));
         SectionLabel(info, "ℹ  Wie es funktioniert", 8, 6);
         info.Controls.Add(new Label {
-            Text = "1. Watchdog startet und pingt die\n    überwachte IP regelmäßig.\n\n" +
-                   "2. Schlägt der Ping X-mal hinter-\n    einander fehl → SSH-Login.\n\n" +
-                   "3. PoE am gewählten Port kurz aus\n    und wieder ein (Neustart Gerät).",
-            Location = new Point(8, 28), Size = new Size(278, 100),
+            Text = "1. Ping der überwachten IP.\n" +
+                   "2. Bei X Fehlversuchen → SSH-Login.\n" +
+                   "3. PoE kurz aus/ein (Neustart).",
+            Location = new Point(8, 26), Size = new Size(278, 58),
             ForeColor = Color.FromArgb(175, 175, 175),
             Font = new Font("Segoe UI", 8.5f)
         });
         ctrl.Controls.Add(info);
+
+        // Autostart-Optionen
+        chkAutoStartWin.Text      = "Mit Windows starten";
+        chkAutoStartWin.AutoSize  = true;
+        chkAutoStartWin.ForeColor = Color.Silver;
+        chkAutoStartWin.Location  = new Point(12, 264);
+        chkAutoStartWin.CheckedChanged += (_, _) => SetAutoStartWithWindows(chkAutoStartWin.Checked);
+        ctrl.Controls.Add(chkAutoStartWin);
+
+        chkAutoStartWatchdog.Text      = "Watchdog automatisch starten";
+        chkAutoStartWatchdog.AutoSize  = true;
+        chkAutoStartWatchdog.ForeColor = Color.Silver;
+        chkAutoStartWatchdog.Location  = new Point(12, 286);
+        ctrl.Controls.Add(chkAutoStartWatchdog);
 
         // ── Manuelle Aktionen ─────────────────────────────────────────────
         var manual = MakePanel(12, 404, 648, 80, Color.FromArgb(38, 38, 38));
@@ -230,7 +370,8 @@ public class MainForm : Form
         Controls.AddRange(new Control[] { bar, cfg, ctrl, manual, logBox });
 
         Log("Bereit. Konfiguration eingeben und Starten klicken.", Level.Info);
-        Log($"Protokolldatei: {LogPath}", Level.Info);
+        Log($"Protokollordner: {LogDir}", Level.Info);
+        CleanupOldLogs();
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -494,7 +635,6 @@ public class MainForm : Form
         {
             lock (LogFileLock)
             {
-                Directory.CreateDirectory(SettingsDir);
                 string date = DateTime.Now.ToString("yyyy-MM-dd");
                 File.AppendAllText(LogPath,
                     $"{date} {ts} [{lv}] {msg.Replace("\n", " | ")}{Environment.NewLine}",
@@ -504,6 +644,26 @@ public class MainForm : Form
         catch
         {
             // Logging darf die App nicht zum Absturz bringen
+        }
+    }
+
+    // Löscht Log-Dateien, die älter als LogRetentionDays sind – verhindert
+    // unbegrenztes Wachstum des Log-Ordners über die Zeit.
+    static void CleanupOldLogs()
+    {
+        try
+        {
+            Directory.CreateDirectory(LogDir);
+            var cutoff = DateTime.Now.AddDays(-LogRetentionDays);
+            foreach (var file in Directory.GetFiles(LogDir, "poewatchdog_*.log"))
+            {
+                if (File.GetLastWriteTime(file) < cutoff)
+                    File.Delete(file);
+            }
+        }
+        catch
+        {
+            // best effort – darf den Start nicht verhindern
         }
     }
 
@@ -602,16 +762,22 @@ public class MainForm : Form
     {
         try
         {
-            Directory.CreateDirectory(SettingsDir);
-            if (!File.Exists(LogPath))
-                File.AppendAllText(LogPath, "", Encoding.UTF8); // leere Datei anlegen, falls noch nichts geloggt wurde
+            Directory.CreateDirectory(LogDir);
 
-            // Explorer mit markierter Datei öffnen (funktioniert auch ohne Standard-App-Zuordnung)
-            System.Diagnostics.Process.Start("explorer.exe", $"/select,\"{LogPath}\"");
+            var newest = Directory.GetFiles(LogDir, "poewatchdog_*.log")
+                                   .OrderByDescending(File.GetLastWriteTime)
+                                   .FirstOrDefault();
+
+            if (newest != null)
+                // Explorer mit markierter aktuellster Log-Datei öffnen
+                System.Diagnostics.Process.Start("explorer.exe", $"/select,\"{newest}\"");
+            else
+                // Noch keine Logs vorhanden -> einfach den Ordner öffnen
+                System.Diagnostics.Process.Start("explorer.exe", $"\"{LogDir}\"");
         }
         catch (Exception ex)
         {
-            Log($"Protokolldatei konnte nicht geöffnet werden: {ex.Message}", Level.Warn);
+            Log($"Protokollordner konnte nicht geöffnet werden: {ex.Message}", Level.Warn);
         }
     }
 
@@ -632,7 +798,8 @@ public class MainForm : Form
                 Retries     = (int)numRetries.Value,
                 PoEOff      = (int)numPoEOff.Value,
                 SavePass    = chkSavePass.Checked,
-                Password    = chkSavePass.Checked ? Protect(txtPassword.Text) : ""
+                Password    = chkSavePass.Checked ? Protect(txtPassword.Text) : "",
+                AutoStartWatchdog = chkAutoStartWatchdog.Checked
             };
 
             Directory.CreateDirectory(SettingsDir);
@@ -649,6 +816,8 @@ public class MainForm : Form
     {
         try
         {
+            chkAutoStartWin.Checked = IsAutoStartWithWindowsEnabled();
+
             if (!File.Exists(SettingsPath)) return;
             var s = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SettingsPath));
             if (s == null) return;
@@ -664,12 +833,54 @@ public class MainForm : Form
             chkSavePass.Checked = s.SavePass;
             if (s.SavePass && !string.IsNullOrEmpty(s.Password))
                 txtPassword.Text = Unprotect(s.Password);
+
+            chkAutoStartWatchdog.Checked = s.AutoStartWatchdog;
         }
         catch (Exception ex)
         {
             Log($"Einstellungen konnten nicht geladen werden: {ex.Message}", Level.Warn);
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  AUTOSTART MIT WINDOWS  –  HKCU Run-Key, kein Admin nötig
+    // ─────────────────────────────────────────────────────────────────────────
+    static string GetExePath() =>
+        Environment.ProcessPath ?? System.Reflection.Assembly.GetExecutingAssembly().Location;
+
+    static bool IsAutoStartWithWindowsEnabled()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(AutoStartRegKey, false);
+            return key?.GetValue(AutoStartValName) is string v && !string.IsNullOrEmpty(v);
+        }
+        catch { return false; }
+    }
+
+    void SetAutoStartWithWindows(bool enabled)
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(AutoStartRegKey, true)
+                             ?? Registry.CurrentUser.CreateSubKey(AutoStartRegKey, true);
+            if (enabled)
+            {
+                key.SetValue(AutoStartValName, $"\"{GetExePath()}\" --autostart");
+                Log("Autostart mit Windows aktiviert.", Level.Info);
+            }
+            else
+            {
+                key.DeleteValue(AutoStartValName, false);
+                Log("Autostart mit Windows deaktiviert.", Level.Info);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"Autostart-Einstellung konnte nicht geändert werden: {ex.Message}", Level.Warn);
+        }
+    }
+
 
     // Leichter Schutz für das gespeicherte Passwort (kein Klartext auf der Platte).
     // Hinweis: DPAPI ist an den Windows-Benutzer/-Rechner gebunden – kein Ersatz
@@ -706,6 +917,7 @@ public class MainForm : Form
         public int    PoEOff    { get; set; }
         public bool   SavePass  { get; set; }
         public string Password  { get; set; } = "";
+        public bool   AutoStartWatchdog { get; set; }
     }
 
 }
