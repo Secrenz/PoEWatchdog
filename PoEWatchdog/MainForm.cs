@@ -588,7 +588,7 @@ public class MainForm : Form
 
             using var shell = client.CreateShellStream("vt100", 200, 50, 800, 600, 4096);
             Thread.Sleep(500);
-            Log($"[{entry.Name}] " + shell.Read().TrimEnd(), Level.Info);
+            shell.Read(); // Login-Banner verwerfen (nicht mitprotokollieren – nur Rauschen)
 
             RunInShell(shell, "system-view",            line => Log($"[{entry.Name}] {line}", Level.Info));
             RunInShell(shell, $"interface {entry.PoEPort}", line => Log($"[{entry.Name}] {line}", Level.Info));
@@ -614,12 +614,23 @@ public class MainForm : Form
     }
 
     // Führt einen einzelnen Befehl in einer bereits offenen Shell-Sitzung aus.
+    // Loggt standardmäßig nur eine knappe Zeile pro Befehl – die volle, mehrzeilige
+    // Switch-Antwort (Banner/Echo) wird nur bei verdächtigen/Error-Ausgaben mitgeschrieben,
+    // damit das Protokoll bei jedem PoE-Reset nicht unnötig aufgebläht wird.
     static void RunInShell(Renci.SshNet.ShellStream shell, string cmd, Action<string> onCommandLogged)
     {
         shell.WriteLine(cmd);
         Thread.Sleep(700); // Switch Zeit geben, den Befehl zu verarbeiten und zu antworten
         string chunk = shell.Read();
-        onCommandLogged($"  $ {cmd}\n{chunk.TrimEnd()}");
+
+        bool looksLikeError = chunk.IndexOf("Error", StringComparison.OrdinalIgnoreCase) >= 0
+                            || chunk.IndexOf("% ", StringComparison.Ordinal) >= 0
+                            || chunk.IndexOf("Unrecognized", StringComparison.OrdinalIgnoreCase) >= 0
+                            || chunk.IndexOf("Wrong", StringComparison.OrdinalIgnoreCase) >= 0;
+
+        onCommandLogged(looksLikeError
+            ? $"  $ {cmd}\n{chunk.TrimEnd()}"   // verdächtig → volle Ausgabe für die Diagnose
+            : $"  $ {cmd}  ✓");                  // normal → eine knappe Zeile
     }
 
     // Führt mehrere Befehle in EINER durchgehenden VRP-CLI-Sitzung aus.
