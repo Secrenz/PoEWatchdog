@@ -10,6 +10,7 @@ using System.Linq;
 using System.Net.NetworkInformation;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -26,20 +27,46 @@ static void AppMain(string[] args)
 AppMain(Environment.GetCommandLineArgs()[1..]);
 
 // ═════════════════════════════════════════════════════════════════════════════
+//  EIN EINZELNER ÜBERWACHUNGS-EINTRAG (ein Switch/Port-Paar)
+// ═════════════════════════════════════════════════════════════════════════════
+public class WatchEntry
+{
+    public string Name      { get; set; } = "Neue Überwachung";
+    public string MonitorIP { get; set; } = "";
+    public string SwitchIP  { get; set; } = "";
+    public string User      { get; set; } = "";
+    public string PoEPort   { get; set; } = "";
+    public int    Interval         { get; set; } = 30;
+    public int    Retries          { get; set; } = 3;
+    public int    PoEOff           { get; set; } = 10;
+    public int    MaxResets        { get; set; } = 5;    // 0 = unbegrenzt
+    public int    PostResetTimeout { get; set; } = 120;  // Sekunden auf Wiederherstellung warten
+    public int    TotalResets      { get; set; } = 0;   // persistent gespeichert
+    public bool   SavePassword      { get; set; } = false;
+    public string PasswordEncrypted { get; set; } = "";
+
+    // ── Laufzeit-only, wird nicht gespeichert ───────────────────────────────
+    [JsonIgnore] public string Password = "";
+    [JsonIgnore] public CancellationTokenSource? Cts;
+    [JsonIgnore] public int FailCount;
+    [JsonIgnore] public int ResetCount;      // Session-Zähler (seit letztem Start)
+    [JsonIgnore] public string Status = "Gestoppt";
+    [JsonIgnore] public string LastPing = "–";
+    [JsonIgnore] public ListViewItem? Item;
+    [JsonIgnore] public bool IsRunning => Cts != null && !Cts.IsCancellationRequested;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 public class MainForm : Form
 {
-    // ── Eingabefelder ─────────────────────────────────────────────────────────
-    private TextBox         txtMonitorIP  = new();
-    private TextBox         txtSwitchIP   = new();
-    private TextBox         txtUser       = new();
-    private TextBox         txtPassword   = new();
-    private TextBox         txtPoEPort    = new();
-    private NumericUpDown   numInterval   = new();
-    private NumericUpDown   numRetries    = new();
-    private NumericUpDown   numPoEOff     = new();
-    private CheckBox        chkSavePass   = new();
+    // ── Überwachungen ─────────────────────────────────────────────────────────
+    private readonly List<WatchEntry> entries = new();
+    private ListView         lvEntries  = new();
+    private ComboBox         cmbTarget  = new();
+    private Button           btnEdit    = new();
+
     private CheckBox        chkAutoStartWin       = new();
-    private CheckBox        chkAutoStartWatchdog  = new();
+    private CheckBox        chkAutoStartAll       = new();
 
     // ── Tray ──────────────────────────────────────────────────────────────────
     private NotifyIcon         trayIcon = new();
@@ -80,18 +107,16 @@ public class MainForm : Form
     }
     static readonly object LogFileLock  = new();
 
-    // ── Buttons & Log ─────────────────────────────────────────────────────────
-    private Button          btnStart      = new();
-    private Button          btnStop       = new();
+    // ── UI ────────────────────────────────────────────────────────────────────
     private RichTextBox     rtbLog        = new();
     private Label           lblStatus     = new();
     private Panel           pnlDot        = new();
+    private Color           _dotColor     = Color.Gray;
 
-    // ── Laufzeitstatus ────────────────────────────────────────────────────────
-    private CancellationTokenSource? _cts;
-    private int   _failCount  = 0;
-    private int   _resetTotal = 0;
-    private Color _dotColor   = Color.Gray;
+    // Begrenzung der Log-Anzeige im UI, damit der RAM-Verbrauch über lange
+    // Laufzeiten nicht unbegrenzt wächst (die Datei auf der Platte bleibt vollständig).
+    const int MaxLogTextChars = 300_000;
+    int _logFilter = 0; // 0=Alle, 1=Fehler, 2=Resets, 3=Heartbeat
 
     // ═════════════════════════════════════════════════════════════════════════
     public MainForm(bool startedMinimized = false)
@@ -114,19 +139,14 @@ public class MainForm : Form
             ShowInTaskbar = false;
         }
 
-        if (chkAutoStartWatchdog.Checked)
+        if (chkAutoStartAll.Checked)
         {
-            if (string.IsNullOrWhiteSpace(txtMonitorIP.Text) ||
-                string.IsNullOrWhiteSpace(txtSwitchIP.Text)  ||
-                string.IsNullOrWhiteSpace(txtUser.Text)      ||
-                string.IsNullOrWhiteSpace(txtPoEPort.Text))
-            {
-                Log("Automatischer Start übersprungen – Konfiguration unvollständig.", Level.Warn);
-            }
+            if (entries.Count == 0)
+                Log("Automatischer Start übersprungen – keine Überwachungen konfiguriert.", Level.Warn);
             else
             {
-                Log("Automatischer Start des Watchdogs (Einstellung aktiv) …", Level.Info);
-                OnStart(this, EventArgs.Empty);
+                Log("Automatischer Start aller Überwachungen (Einstellung aktiv) …", Level.Info);
+                StartAll();
             }
         }
     }
@@ -142,15 +162,30 @@ public class MainForm : Form
 
     void MainForm_FormClosing(object? sender, FormClosingEventArgs e)
     {
-        if (!_exitRequested)
+        if (!_exitRequested && e.CloseReason == CloseReason.UserClosing)
         {
-            // Klick auf "X" → in den Tray legen statt beenden
-            e.Cancel = true;
-            Hide();
-            ShowInTaskbar = false;
-            trayIcon.ShowBalloonTip(1500, "PoE Watchdog",
-                _cts != null ? "Läuft im Hintergrund weiter." : "In den Tray gelegt.", ToolTipIcon.Info);
-            return;
+            using var dlg = new CloseChoiceDialog();
+            var result = dlg.ShowDialog(this);
+
+            if (result == DialogResult.Cancel)
+            {
+                e.Cancel = true;
+                return;
+            }
+
+            if (dlg.GoToTray)
+            {
+                e.Cancel = true;
+                SaveSettings();
+                Hide();
+                ShowInTaskbar = false;
+                trayIcon.ShowBalloonTip(1500, "PoE Watchdog",
+                    entries.Any(en => en.IsRunning) ? "Läuft im Hintergrund weiter." : "In den Tray gelegt.",
+                    ToolTipIcon.Info);
+                return;
+            }
+
+            _exitRequested = true; // Nutzer hat "Beenden" gewählt
         }
 
         SaveSettings();
@@ -162,11 +197,11 @@ public class MainForm : Form
         trayToggleItem.Text  = "Öffnen";
         trayToggleItem.Click += (_, _) => ShowFromTray();
 
-        var itemStart = new ToolStripMenuItem("Watchdog starten");
-        itemStart.Click += (_, _) => { if (btnStart.Enabled) OnStart(this, EventArgs.Empty); };
+        var itemStart = new ToolStripMenuItem("Alle starten");
+        itemStart.Click += (_, _) => StartAll();
 
-        var itemStop = new ToolStripMenuItem("Watchdog stoppen");
-        itemStop.Click += (_, _) => OnStop(this, EventArgs.Empty);
+        var itemStop = new ToolStripMenuItem("Alle stoppen");
+        itemStop.Click += (_, _) => StopAll();
 
         var itemExit = new ToolStripMenuItem("Beenden");
         itemExit.Click += (_, _) => { _exitRequested = true; Close(); };
@@ -177,7 +212,26 @@ public class MainForm : Form
         });
 
         trayIcon.Text          = "Huawei PoE Watchdog";
-        trayIcon.Icon          = SystemIcons.Shield;
+
+        // Icon aus der .ico-Datei laden (wird beim Publish mit eingebettet)
+        try
+        {
+            string icoPath = Path.Combine(AppContext.BaseDirectory, "app.ico");
+            if (File.Exists(icoPath))
+            {
+                var icon = new Icon(icoPath);
+                trayIcon.Icon = icon;
+                Icon = icon;  // Auch Fenster- und Taskleisten-Icon setzen
+            }
+            else
+            {
+                trayIcon.Icon = SystemIcons.Shield;
+            }
+        }
+        catch
+        {
+            trayIcon.Icon = SystemIcons.Shield;
+        }
         trayIcon.ContextMenuStrip = trayMenu;
         trayIcon.Visible       = true;
         trayIcon.DoubleClick  += (_, _) => ShowFromTray();
@@ -221,124 +275,155 @@ public class MainForm : Form
 
         lblStatus.AutoSize  = true;
         lblStatus.Location  = new Point(36, 12);
-        lblStatus.Text      = "Gestoppt";
+        lblStatus.Text      = "Keine Überwachungen";
         lblStatus.ForeColor = Color.Silver;
         lblStatus.Font      = new Font("Segoe UI", 9.5f, FontStyle.Bold);
         bar.Controls.AddRange(new Control[] { pnlDot, lblStatus });
 
-        // ── Konfigurationsblock ───────────────────────────────────────────
-        var cfg = MakePanel(12, 52, 318, 340, Color.FromArgb(38, 38, 38));
-        SectionLabel(cfg, "⚙  Verbindung & Port", 10, 8);
+        // ── Überwachungen (Liste) ───────────────────────────────────────────
+        var entriesPanel = MakePanel(12, 52, 648, 280, Color.FromArgb(38, 38, 38));
+        SectionLabel(entriesPanel, "📡  Überwachungen", 10, 8);
 
-        int y = 34;
-        Row(cfg, "Überwachte IP:",       ref y); txtMonitorIP = Field(cfg, "192.168.1.100", 165, y - 22, 140);
-        Row(cfg, "Switch IP:",           ref y); txtSwitchIP  = Field(cfg, "192.168.1.1",   165, y - 22, 140);
-        Row(cfg, "SSH Benutzer:",        ref y); txtUser      = Field(cfg, "admin",          165, y - 22, 140);
-        Row(cfg, "SSH Passwort:",        ref y);
-        txtPassword = Field(cfg, "", 165, y - 22, 140);
-        txtPassword.UseSystemPasswordChar = true;
+        lvEntries.View          = View.Details;
+        lvEntries.Location      = new Point(10, 30);
+        lvEntries.Size          = new Size(628, 170);
+        lvEntries.FullRowSelect = true;
+        lvEntries.GridLines     = true;
+        lvEntries.MultiSelect   = false;
+        lvEntries.BackColor     = Color.FromArgb(18, 18, 18);
+        lvEntries.ForeColor     = Color.White;
+        lvEntries.BorderStyle   = BorderStyle.FixedSingle;
+        lvEntries.Font          = new Font("Segoe UI", 8.5f);
+        lvEntries.Columns.Add("Name",          100);
+        lvEntries.Columns.Add("Überwachte IP",  95);
+        lvEntries.Columns.Add("Switch IP",      90);
+        lvEntries.Columns.Add("Port",           110);
+        lvEntries.Columns.Add("Letzter Ping",   76);
+        lvEntries.Columns.Add("Resets",         48);
+        lvEntries.Columns.Add("Status",         95);
 
-        chkSavePass.Text      = "Passwort merken";
-        chkSavePass.AutoSize  = true;
-        chkSavePass.ForeColor = Color.Silver;
-        chkSavePass.Location  = new Point(165, y + 4);
-        chkSavePass.Font      = new Font("Segoe UI", 7.5f);
-        cfg.Controls.Add(chkSavePass);
-        y += 24;
+        // Rechtsklick-Kontextmenü
+        var ctx = new ContextMenuStrip { BackColor = Color.FromArgb(38,38,38), ForeColor = Color.White };
+        var ctxStart  = new ToolStripMenuItem("▶ Start");
+        var ctxStop   = new ToolStripMenuItem("⏹ Stop");
+        var ctxEdit   = new ToolStripMenuItem("✏ Bearbeiten");
+        var ctxRemove = new ToolStripMenuItem("🗑 Entfernen");
+        ctx.Items.AddRange(new ToolStripItem[] { ctxStart, ctxStop, new ToolStripSeparator(), ctxEdit, ctxRemove });
+        ctxStart.Click  += (_, _) => { var s = GetSelectedEntry(); if (s != null) StartEntry(s); };
+        ctxStop.Click   += (_, _) => { var s = GetSelectedEntry(); if (s != null) StopEntry(s);  };
+        ctxEdit.Click   += (_, _) => OnEditEntry();
+        ctxRemove.Click += (_, _) => OnRemoveEntry();
+        ctx.Opening     += (_, _) => {
+            var s = GetSelectedEntry();
+            ctxStart.Enabled  = s != null && !s.IsRunning;
+            ctxStop.Enabled   = s != null &&  s.IsRunning;
+            ctxEdit.Enabled   = s != null;
+            ctxRemove.Enabled = s != null;
+        };
+        lvEntries.ContextMenuStrip = ctx;
 
-        Row(cfg, "PoE Port:",            ref y); txtPoEPort   = Field(cfg, "GigabitEthernet0/0/5", 165, y - 22, 140);
+        var btnAdd      = SmallBtn("Hinzufügen", Color.FromArgb(58, 58, 58), 10,  208, 86);
+        btnEdit         = SmallBtn("Bearbeiten", Color.FromArgb(58, 58, 58), 100, 208, 86);
+        var btnRemove   = SmallBtn("Entfernen",  Color.FromArgb(120, 50, 50), 190, 208, 86);
+        var btnStartSel = SmallBtn("Start",      Color.FromArgb(40, 130, 70), 286, 208, 64);
+        var btnStopSel  = SmallBtn("Stop",       Color.FromArgb(120, 70, 30), 354, 208, 64);
+        var btnStartAll = SmallBtn("Start alle", Color.FromArgb(0, 110, 190), 426, 208, 96);
+        var btnStopAll  = SmallBtn("Stop alle",  Color.FromArgb(70, 70, 70),  526, 208, 96);
 
-        var sep = new Panel { Location = new Point(10, y + 4), Size = new Size(296, 1),
-                              BackColor = Color.FromArgb(65, 65, 65) };
-        cfg.Controls.Add(sep); y += 16;
+        btnAdd.Click      += (_, _) => OnAddEntry();
+        btnEdit.Click      += (_, _) => OnEditEntry();
+        btnRemove.Click   += (_, _) => OnRemoveEntry();
+        btnStartSel.Click += (_, _) => { var sel = GetSelectedEntry(); if (sel != null) StartEntry(sel); };
+        btnStopSel.Click  += (_, _) => { var sel = GetSelectedEntry(); if (sel != null) StopEntry(sel); };
+        btnStartAll.Click += (_, _) => StartAll();
+        btnStopAll.Click  += (_, _) => StopAll();
+        lvEntries.DoubleClick += (_, _) => OnEditEntry();
 
-        SectionLabel(cfg, "⏱  Timing", 10, y); y += 26;
-        Row(cfg, "Prüfintervall (s):",   ref y); numInterval = Spin(cfg, 30,  5,  300, 165, y - 22, 80);
-        Row(cfg, "Fehlversuche:",        ref y); numRetries  = Spin(cfg, 3,   1,   20, 165, y - 22, 80);
-        Row(cfg, "PoE-Pause (s):",       ref y); numPoEOff   = Spin(cfg, 10,  3,  120, 165, y - 22, 80);
-
-        // ── Steuerungsblock ───────────────────────────────────────────────
-        var ctrl = MakePanel(342, 52, 318, 340, Color.FromArgb(38, 38, 38));
-        SectionLabel(ctrl, "▶  Steuerung", 10, 8);
-
-        btnStart.Text      = "▶  Watchdog starten";
-        btnStart.Location  = new Point(10, 40);
-        btnStart.Size      = new Size(296, 52);
-        btnStart.BackColor = Color.FromArgb(0, 120, 212);
-        btnStart.ForeColor = Color.White;
-        btnStart.FlatStyle = FlatStyle.Flat;
-        btnStart.Font      = new Font("Segoe UI", 11f, FontStyle.Bold);
-        btnStart.Cursor    = Cursors.Hand;
-        btnStart.FlatAppearance.BorderSize = 0;
-        btnStart.Click    += OnStart;
-
-        btnStop.Text       = "⏹  Stoppen";
-        btnStop.Location   = new Point(10, 104);
-        btnStop.Size       = new Size(296, 44);
-        btnStop.BackColor  = Color.FromArgb(65, 65, 65);
-        btnStop.ForeColor  = Color.White;
-        btnStop.FlatStyle  = FlatStyle.Flat;
-        btnStop.Font       = new Font("Segoe UI", 10f, FontStyle.Bold);
-        btnStop.Enabled    = false;
-        btnStop.Cursor     = Cursors.Hand;
-        btnStop.FlatAppearance.BorderSize = 0;
-        btnStop.Click     += OnStop;
-
-        ctrl.Controls.AddRange(new Control[] { btnStart, btnStop });
-
-        // Info-Box
-        var info = MakePanel(10, 162, 296, 92, Color.FromArgb(25, 25, 25));
-        SectionLabel(info, "ℹ  Wie es funktioniert", 8, 6);
-        info.Controls.Add(new Label {
-            Text = "1. Ping der überwachten IP.\n" +
-                   "2. Bei X Fehlversuchen → SSH-Login.\n" +
-                   "3. PoE kurz aus/ein (Neustart).",
-            Location = new Point(8, 26), Size = new Size(278, 58),
-            ForeColor = Color.FromArgb(175, 175, 175),
-            Font = new Font("Segoe UI", 8.5f)
-        });
-        ctrl.Controls.Add(info);
-
-        // Autostart-Optionen
         chkAutoStartWin.Text      = "Mit Windows starten";
         chkAutoStartWin.AutoSize  = true;
         chkAutoStartWin.ForeColor = Color.Silver;
-        chkAutoStartWin.Location  = new Point(12, 264);
+        chkAutoStartWin.Location  = new Point(10, 244);
         chkAutoStartWin.CheckedChanged += (_, _) => SetAutoStartWithWindows(chkAutoStartWin.Checked);
-        ctrl.Controls.Add(chkAutoStartWin);
 
-        chkAutoStartWatchdog.Text      = "Watchdog automatisch starten";
-        chkAutoStartWatchdog.AutoSize  = true;
-        chkAutoStartWatchdog.ForeColor = Color.Silver;
-        chkAutoStartWatchdog.Location  = new Point(12, 286);
-        ctrl.Controls.Add(chkAutoStartWatchdog);
+        chkAutoStartAll.Text      = "Beim Start alle Überwachungen automatisch starten";
+        chkAutoStartAll.AutoSize  = true;
+        chkAutoStartAll.ForeColor = Color.Silver;
+        chkAutoStartAll.Location  = new Point(170, 244);
+        chkAutoStartAll.CheckedChanged += (_, _) => SaveSettings();
+
+        entriesPanel.Controls.AddRange(new Control[] {
+            lvEntries, btnAdd, btnEdit, btnRemove, btnStartSel, btnStopSel, btnStartAll, btnStopAll,
+            chkAutoStartWin, chkAutoStartAll
+        });
 
         // ── Manuelle Aktionen ─────────────────────────────────────────────
-        var manual = MakePanel(12, 404, 648, 80, Color.FromArgb(38, 38, 38));
-        SectionLabel(manual, "🖱  Manuelle Aktionen", 10, 6);
+        var manual = MakePanel(12, 342, 648, 90, Color.FromArgb(38, 38, 38));
+        SectionLabel(manual, "🖱  Manuelle Aktion für:", 10, 8);
 
-        var btnPoEOff = MakeActionBtn("⚡ PoE AUS",   Color.FromArgb(180, 60, 60),  10,  28);
-        var btnPoEOn  = MakeActionBtn("⚡ PoE EIN",   Color.FromArgb(40, 140, 70),  170, 28);
-        var btnIfDown = MakeActionBtn("🔽 Port DOWN", Color.FromArgb(160, 100, 20), 330, 28);
-        var btnIfUp   = MakeActionBtn("🔼 Port UP",   Color.FromArgb(30, 110, 160), 490, 28);
+        cmbTarget.Location    = new Point(220, 5);
+        cmbTarget.Size        = new Size(260, 24);
+        cmbTarget.DropDownStyle = ComboBoxStyle.DropDownList;
+        cmbTarget.BackColor   = Color.FromArgb(48, 48, 48);
+        cmbTarget.ForeColor   = Color.White;
 
-        btnPoEOff.Click += async (_, _) => await ManualAction("PoE deaktivieren",
-            new[] { "system-view", $"interface {txtPoEPort.Text.Trim()}", "undo poe enable", "quit", "quit" });
+        var btnPoEOff = MakeActionBtn("⚡ PoE AUS",   Color.FromArgb(180, 60, 60),  10,  36);
+        var btnPoEOn  = MakeActionBtn("⚡ PoE EIN",   Color.FromArgb(40, 140, 70),  170, 36);
+        var btnIfDown = MakeActionBtn("🔽 Port DOWN", Color.FromArgb(160, 100, 20), 330, 36);
+        var btnIfUp   = MakeActionBtn("🔼 Port UP",   Color.FromArgb(30, 110, 160), 490, 36);
+        // Buttons etwas kompakter, damit sie in die niedrigere Manual-Leiste passen
+        foreach (var b in new[] { btnPoEOff, btnPoEOn, btnIfDown, btnIfUp }) b.Size = new Size(150, 32);
 
-        btnPoEOn.Click += async (_, _) => await ManualAction("PoE aktivieren",
-            new[] { "system-view", $"interface {txtPoEPort.Text.Trim()}", "poe enable", "quit", "quit" });
+        btnPoEOff.Click += async (_, _) => {
+            var t = GetTargetEntry(); if (t == null) { WarnNoTarget(); return; }
+            await ManualAction(t, "PoE deaktivieren",
+                new[] { "system-view", $"interface {t.PoEPort}", "undo poe enable", "quit", "quit" });
+        };
+        btnPoEOn.Click += async (_, _) => {
+            var t = GetTargetEntry(); if (t == null) { WarnNoTarget(); return; }
+            await ManualAction(t, "PoE aktivieren",
+                new[] { "system-view", $"interface {t.PoEPort}", "poe enable", "quit", "quit" });
+        };
+        btnIfDown.Click += async (_, _) => {
+            var t = GetTargetEntry(); if (t == null) { WarnNoTarget(); return; }
+            await ManualAction(t, "Port herunterfahren",
+                new[] { "system-view", $"interface {t.PoEPort}", "shutdown", "quit", "quit" });
+        };
+        btnIfUp.Click += async (_, _) => {
+            var t = GetTargetEntry(); if (t == null) { WarnNoTarget(); return; }
+            await ManualAction(t, "Port hochfahren",
+                new[] { "system-view", $"interface {t.PoEPort}", "undo shutdown", "quit", "quit" });
+        };
 
-        btnIfDown.Click += async (_, _) => await ManualAction("Port herunterfahren",
-            new[] { "system-view", $"interface {txtPoEPort.Text.Trim()}", "shutdown", "quit", "quit" });
-
-        btnIfUp.Click += async (_, _) => await ManualAction("Port hochfahren",
-            new[] { "system-view", $"interface {txtPoEPort.Text.Trim()}", "undo shutdown", "quit", "quit" });
-
-        manual.Controls.AddRange(new Control[] { btnPoEOff, btnPoEOn, btnIfDown, btnIfUp });
+        manual.Controls.AddRange(new Control[] { cmbTarget, btnPoEOff, btnPoEOn, btnIfDown, btnIfUp });
 
         // ── Log ───────────────────────────────────────────────────────────
-        var logBox = MakePanel(12, 494, 648, 238, Color.FromArgb(38, 38, 38));
+        var logBox = MakePanel(12, 442, 648, 288, Color.FromArgb(38, 38, 38));
         SectionLabel(logBox, "📋  Protokoll", 10, 8);
+
+        // Filter-Buttons
+        string[] filterLabels = { "Alle", "⚠ Fehler", "⚡ Resets", "💓 Heartbeat" };
+        var filterBtns = new Button[filterLabels.Length];
+        for (int i = 0; i < filterLabels.Length; i++)
+        {
+            int idx = i;
+            filterBtns[i] = new Button {
+                Text = filterLabels[i],
+                Location = new Point(10 + idx * 86, 5),
+                Size = new Size(82, 22),
+                BackColor = idx == 0 ? Color.FromArgb(0, 110, 190) : Color.FromArgb(48, 48, 48),
+                ForeColor = Color.White, FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 7.5f), Cursor = Cursors.Hand,
+                Tag = idx
+            };
+            filterBtns[i].FlatAppearance.BorderSize = 0;
+            filterBtns[i].Click += (s, _) => {
+                foreach (var fb in filterBtns)
+                    fb.BackColor = Color.FromArgb(48, 48, 48);
+                ((Button)s!).BackColor = Color.FromArgb(0, 110, 190);
+                _logFilter = (int)((Button)s!).Tag!;
+            };
+            logBox.Controls.Add(filterBtns[i]);
+        }
 
         var btnOpenLog = new Button {
             Text = "Log öffnen", Location = new Point(498, 5), Size = new Size(72, 22),
@@ -357,7 +442,7 @@ public class MainForm : Form
         btnClear.Click += (_, _) => rtbLog.Clear();
 
         rtbLog.Location    = new Point(8, 30);
-        rtbLog.Size        = new Size(630, 196);
+        rtbLog.Size        = new Size(630, 246);
         rtbLog.BackColor   = Color.FromArgb(18, 18, 18);
         rtbLog.ForeColor   = Color.FromArgb(200, 200, 200);
         rtbLog.Font        = new Font("Consolas", 8.5f);
@@ -367,93 +452,276 @@ public class MainForm : Form
         logBox.Controls.AddRange(new Control[] { btnOpenLog, btnClear, rtbLog });
 
         // ── Alles auf Form ────────────────────────────────────────────────
-        Controls.AddRange(new Control[] { bar, cfg, ctrl, manual, logBox });
+        Controls.AddRange(new Control[] { bar, entriesPanel, manual, logBox });
 
-        Log("Bereit. Konfiguration eingeben und Starten klicken.", Level.Info);
+        Log("Bereit. Überwachung über „Hinzufügen“ anlegen.", Level.Info);
         Log($"Protokollordner: {LogDir}", Level.Info);
         CleanupOldLogs();
     }
 
+    void WarnNoTarget() =>
+        MessageBox.Show("Bitte zuerst eine Überwachung anlegen und im Dropdown auswählen.",
+            "Keine Auswahl", MessageBoxButtons.OK, MessageBoxIcon.Information);
+
     // ─────────────────────────────────────────────────────────────────────────
-    //  WATCHDOG
+    //  ÜBERWACHUNGEN VERWALTEN
     // ─────────────────────────────────────────────────────────────────────────
-    async void OnStart(object? s, EventArgs e)
+    WatchEntry? GetSelectedEntry() =>
+        lvEntries.SelectedItems.Count > 0 ? (WatchEntry)lvEntries.SelectedItems[0].Tag : null;
+
+    WatchEntry? GetTargetEntry() =>
+        cmbTarget.SelectedIndex >= 0 && cmbTarget.SelectedIndex < entries.Count
+            ? entries[cmbTarget.SelectedIndex] : null;
+
+    void OnAddEntry()
     {
-        if (string.IsNullOrWhiteSpace(txtMonitorIP.Text) ||
-            string.IsNullOrWhiteSpace(txtSwitchIP.Text)  ||
-            string.IsNullOrWhiteSpace(txtUser.Text)      ||
-            string.IsNullOrWhiteSpace(txtPoEPort.Text))
+        using var dlg = new EntryEditDialog(null);
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+        entries.Add(dlg.Result);
+        RefreshListView();
+        RefreshCombo();
+        SaveSettings();
+        Log($"Überwachung „{dlg.Result.Name}“ hinzugefügt.", Level.Info);
+    }
+
+    void OnEditEntry()
+    {
+        var sel = GetSelectedEntry();
+        if (sel == null)
         {
-            MessageBox.Show("Bitte alle Felder ausfüllen.", "Fehlende Eingabe",
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show("Bitte zuerst eine Überwachung in der Liste auswählen.",
+                "Hinweis", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
-        _cts        = new CancellationTokenSource();
-        _failCount  = 0;
-        _resetTotal = 0;
-        SetUI(true);
+        using var dlg = new EntryEditDialog(sel);
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
-        // Werte vor Thread-Start lesen (UI-Thread)
-        string monIP    = txtMonitorIP.Text.Trim();
-        string swIP     = txtSwitchIP.Text.Trim();
-        string user     = txtUser.Text.Trim();
-        string pass     = txtPassword.Text;
-        string port     = txtPoEPort.Text.Trim();
-        int    interval = (int)numInterval.Value;
-        int    retries  = (int)numRetries.Value;
-        int    poeOff   = (int)numPoEOff.Value;
-
-        Log($"Gestartet  ▸  Monitor: {monIP}  |  Switch: {swIP}  |  Port: {port}", Level.Info);
-        Log($"Intervall: {interval}s  |  Auslösung nach {retries} Fehlern  |  PoE-Pause: {poeOff}s", Level.Info);
-
-        var token = _cts.Token;
-        await Task.Run(() => Loop(monIP, swIP, user, pass, port, interval, retries, poeOff, token));
-
-        SetUI(false);
-        Log("Watchdog gestoppt.", Level.Info);
-        SetDot(DotColor.Gray, "Gestoppt");
+        RefreshListView();
+        RefreshCombo();
+        SaveSettings();
+        Log($"Überwachung „{sel.Name}“ aktualisiert.", Level.Info);
     }
 
-    void OnStop(object? s, EventArgs e) => _cts?.Cancel();
-
-    void Loop(string monIP, string swIP, string user, string pass,
-              string port, int interval, int retries, int poeOff,
-              CancellationToken tok)
+    void OnRemoveEntry()
     {
-        while (!tok.IsCancellationRequested)
+        var sel = GetSelectedEntry();
+        if (sel == null) return;
+
+        if (MessageBox.Show($"„{sel.Name}“ wirklich entfernen?", "Entfernen",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+
+        StopEntry(sel);
+        entries.Remove(sel);
+        RefreshListView();
+        RefreshCombo();
+        SaveSettings();
+        Log($"Überwachung „{sel.Name}“ entfernt.", Level.Info);
+    }
+
+    void RefreshListView()
+    {
+        lvEntries.BeginUpdate();
+        lvEntries.Items.Clear();
+        foreach (var en in entries)
         {
-            bool ok = Ping(monIP);
+            var item = new ListViewItem(new[] {
+                en.Name, en.MonitorIP, en.SwitchIP, en.PoEPort,
+                en.LastPing,
+                en.TotalResets > 0 ? en.TotalResets.ToString() : "–",
+                en.Status
+            }) {
+                Tag = en,
+                ForeColor = en.IsRunning ? Color.FromArgb(120, 200, 140) : Color.Silver
+            };
+            en.Item = item;
+            lvEntries.Items.Add(item);
+        }
+        lvEntries.EndUpdate();
+        UpdateGlobalStatus();
+    }
 
-            if (ok)
+    void RefreshCombo()
+    {
+        string? prev = cmbTarget.SelectedItem as string;
+        cmbTarget.Items.Clear();
+        foreach (var en in entries) cmbTarget.Items.Add(en.Name);
+
+        if (cmbTarget.Items.Count == 0) return;
+        int idx = prev != null ? cmbTarget.Items.IndexOf(prev) : -1;
+        cmbTarget.SelectedIndex = idx >= 0 ? idx : 0;
+    }
+
+    void UpdateGlobalStatus()
+    {
+        int running = entries.Count(en => en.IsRunning);
+        lblStatus.Text = entries.Count == 0 ? "Keine Überwachungen" : $"{running} von {entries.Count} aktiv";
+        _dotColor = running > 0 ? Color.FromArgb(80, 200, 120) : Color.Gray;
+        pnlDot.Invalidate();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  WATCHDOG  –  ein async Loop pro Eintrag, RAM-schonend per Task.Delay
+    //  (kein dedizierter blockierender Thread pro Überwachung)
+    // ─────────────────────────────────────────────────────────────────────────
+    void StartEntry(WatchEntry entry)
+    {
+        if (entry.IsRunning) return;
+
+        if (string.IsNullOrWhiteSpace(entry.MonitorIP) || string.IsNullOrWhiteSpace(entry.SwitchIP) ||
+            string.IsNullOrWhiteSpace(entry.User)      || string.IsNullOrWhiteSpace(entry.PoEPort))
+        {
+            Log($"[{entry.Name}] Start übersprungen – Konfiguration unvollständig.", Level.Warn);
+            return;
+        }
+
+        entry.Cts       = new CancellationTokenSource();
+        entry.FailCount = 0;
+        UpdateEntryStatus(entry, "Läuft", Color.FromArgb(80, 200, 120));
+        Log($"[{entry.Name}] Watchdog gestartet  ▸  Monitor: {entry.MonitorIP}  |  Switch: {entry.SwitchIP}  |  Port: {entry.PoEPort}", Level.Info);
+
+        _ = RunWatchdogAsync(entry, entry.Cts.Token);
+        EnsureHeartbeatRunning();
+    }
+
+    void StopEntry(WatchEntry entry) => entry.Cts?.Cancel();
+
+    void StartAll() { foreach (var en in entries.ToList()) StartEntry(en); }
+    void StopAll()  { foreach (var en in entries.ToList()) StopEntry(en); }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  HEARTBEAT  –  einmal pro Intervall eine knappe Statuszeile ins Log
+    // ─────────────────────────────────────────────────────────────────────────
+    const int HeartbeatMinutes = 30;
+    CancellationTokenSource? _heartbeatCts;
+
+    void EnsureHeartbeatRunning()
+    {
+        if (_heartbeatCts != null && !_heartbeatCts.IsCancellationRequested) return;
+        _heartbeatCts = new CancellationTokenSource();
+        _ = RunHeartbeatAsync(_heartbeatCts.Token);
+    }
+
+    async Task RunHeartbeatAsync(CancellationToken token)
+    {
+        try
+        {
+            while (!token.IsCancellationRequested)
             {
-                if (_failCount > 0)
-                    Log($"✔ {monIP} wieder erreichbar – Zähler zurückgesetzt.", Level.Ok);
-                else
-                    Log($"✔ Ping OK  →  {monIP}", Level.Ok);
+                try { await Task.Delay(HeartbeatMinutes * 60 * 1000, token); }
+                catch (TaskCanceledException) { break; }
 
-                _failCount = 0;
-                SetDot(DotColor.Green, $"Läuft – {monIP} erreichbar");
-            }
-            else
-            {
-                _failCount++;
-                Log($"✘ Ping fehlgeschlagen  →  {monIP}  (Versuch {_failCount}/{retries})", Level.Warn);
-                SetDot(DotColor.Yellow, $"Läuft – Ping fehlgeschlagen ({_failCount}/{retries})");
-
-                if (_failCount >= retries)
+                var running = entries.Where(e => e.IsRunning).ToList();
+                if (running.Count == 0)
                 {
-                    _resetTotal++;
-                    Log($"⚡ Schwellwert erreicht – PoE-Reset #{_resetTotal} wird ausgeführt …", Level.Action);
-                    SetDot(DotColor.Purple, "PoE-Reset läuft …");
-                    PoEReset(swIP, user, pass, port, poeOff);
-                    _failCount = 0;
+                    // Keine Überwachungen mehr aktiv → Heartbeat beenden
+                    break;
                 }
-            }
 
-            // Intervall in 100ms-Häppchen (damit Cancel sofort wirkt)
-            for (int i = 0; i < interval * 10 && !tok.IsCancellationRequested; i++)
-                Thread.Sleep(100);
+                string summary = string.Join(", ", running.Select(e =>
+                    e.ResetCount > 0 ? $"{e.Name} ({e.ResetCount}× reset)" : e.Name));
+
+                Log($"💓 Heartbeat – {running.Count} aktiv: {summary}", Level.Info);
+            }
+        }
+        finally
+        {
+            _heartbeatCts = null;
+        }
+    }
+
+    async Task RunWatchdogAsync(WatchEntry entry, CancellationToken token)
+    {
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                bool ok = Ping(entry.MonitorIP);
+                entry.LastPing = DateTime.Now.ToString("HH:mm:ss");
+
+                if (ok)
+                {
+                    if (entry.FailCount > 0)
+                        Log($"[{entry.Name}] ✔ {entry.MonitorIP} wieder erreichbar – Zähler zurückgesetzt.", Level.Ok);
+                    entry.FailCount = 0;
+                    UpdateEntryStatus(entry, "Läuft – OK", Color.FromArgb(80, 200, 120));
+                }
+                else
+                {
+                    entry.FailCount++;
+                    Log($"[{entry.Name}] ✘ Ping fehlgeschlagen → {entry.MonitorIP} (Versuch {entry.FailCount}/{entry.Retries})", Level.Warn);
+                    UpdateEntryStatus(entry, $"Fehler {entry.FailCount}/{entry.Retries}", Color.FromArgb(255, 200, 0));
+
+                    if (entry.FailCount >= entry.Retries)
+                    {
+                        // MaxResets-Grenze prüfen (0 = unbegrenzt)
+                        if (entry.MaxResets > 0 && entry.ResetCount >= entry.MaxResets)
+                        {
+                            Log($"[{entry.Name}] 🛑 Maximale Anzahl Resets ({entry.MaxResets}) erreicht – Watchdog wird gestoppt. Bitte manuell prüfen!", Level.Error);
+                            trayIcon.ShowBalloonTip(5000, "PoE Watchdog – Kritisch",
+                                $"[{entry.Name}] Max. Resets erreicht – Überwachung gestoppt!", ToolTipIcon.Error);
+                            break; // Watchdog für diesen Eintrag beenden
+                        }
+
+                        entry.ResetCount++;
+                        entry.TotalResets++;
+                        SaveSettings(); // TotalResets persistieren
+
+                        Log($"[{entry.Name}] ⚡ Schwellwert erreicht – PoE-Reset #{entry.ResetCount} (gesamt: {entry.TotalResets}) wird ausgeführt …", Level.Action);
+                        UpdateEntryStatus(entry, $"PoE-Reset #{entry.ResetCount} …", Color.FromArgb(190, 90, 255));
+                        trayIcon.ShowBalloonTip(3000, "PoE Watchdog – Reset",
+                            $"[{entry.Name}] PoE-Reset #{entry.ResetCount} gestartet.", ToolTipIcon.Warning);
+
+                        await Task.Run(() => PoEReset(entry));
+                        entry.FailCount = 0;
+
+                        // ── Post-Reset-Timeout: warten bis IP wieder erreichbar ──
+                        Log($"[{entry.Name}] ⏳ Warte auf Wiederherstellung (max. {entry.PostResetTimeout}s) …", Level.Info);
+                        UpdateEntryStatus(entry, "Warte auf Gerät …", Color.FromArgb(255, 200, 0));
+
+                        int waited = 0;
+                        bool recovered = false;
+                        while (waited < entry.PostResetTimeout && !token.IsCancellationRequested)
+                        {
+                            try { await Task.Delay(5000, token); } catch (TaskCanceledException) { goto done; }
+                            waited += 5;
+
+                            if (Ping(entry.MonitorIP))
+                            {
+                                entry.LastPing = DateTime.Now.ToString("HH:mm:ss");
+                                recovered = true;
+                                Log($"[{entry.Name}] ✔ Gerät nach {waited}s wieder erreichbar.", Level.Ok);
+                                trayIcon.ShowBalloonTip(3000, "PoE Watchdog – OK",
+                                    $"[{entry.Name}] Gerät nach Reset wiederhergestellt.", ToolTipIcon.Info);
+                                UpdateEntryStatus(entry, "Läuft – OK", Color.FromArgb(80, 200, 120));
+                                break;
+                            }
+
+                            UpdateEntryStatus(entry, $"Warte {waited}/{entry.PostResetTimeout}s …", Color.FromArgb(255, 200, 0));
+                        }
+
+                        if (!recovered && !token.IsCancellationRequested)
+                        {
+                            Log($"[{entry.Name}] 🛑 Gerät nach {entry.PostResetTimeout}s immer noch nicht erreichbar – Reset gilt als fehlgeschlagen.", Level.Error);
+                            trayIcon.ShowBalloonTip(5000, "PoE Watchdog – Kritisch",
+                                $"[{entry.Name}] Gerät nach Reset nicht wiederhergestellt!", ToolTipIcon.Error);
+                        }
+
+                        done:;
+                    }
+                }
+
+                try { await Task.Delay(entry.Interval * 1000, token); }
+                catch (TaskCanceledException) { break; }
+            }
+        }
+        catch (OperationCanceledException) { /* erwartet beim Stoppen */ }
+        finally
+        {
+            entry.Cts = null;
+            UpdateEntryStatus(entry, "Gestoppt", Color.Gray);
+            Log($"[{entry.Name}] Watchdog gestoppt.", Level.Info);
         }
     }
 
@@ -471,55 +739,66 @@ public class MainForm : Form
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  SSH / PoE RESET  –  verwendet SshCommand, kein ShellStream!
+    //  SSH / PoE RESET  –  EINE durchgehende Shell-Sitzung, kein Logout/Login
+    //  zwischen Ausschalten und Einschalten des PoE.
     // ─────────────────────────────────────────────────────────────────────────
-    void PoEReset(string swIP, string user, string pass, string port, int poeOff)
+    void PoEReset(WatchEntry entry)
     {
         try
         {
-            var auth = new PasswordAuthenticationMethod(user, pass);
-            var conn = new ConnectionInfo(swIP, user, auth)
+            var auth = new PasswordAuthenticationMethod(entry.User, entry.Password);
+            var conn = new ConnectionInfo(entry.SwitchIP, entry.User, auth)
                        { Timeout = TimeSpan.FromSeconds(10) };
 
             using var client = new SshClient(conn);
             client.Connect();
-            Log($"SSH verbunden mit {swIP}", Level.Info);
+            Log($"[{entry.Name}] SSH verbunden mit {entry.SwitchIP}", Level.Info);
 
             using var shell = client.CreateShellStream("vt100", 200, 50, 800, 600, 4096);
             Thread.Sleep(500);
-            Log(shell.Read().TrimEnd(), Level.Info);
+            shell.Read(); // Login-Banner verwerfen (nicht mitprotokollieren – nur Rauschen)
 
-            // Einmal einloggen, im Interface bleiben, PoE aus, warten, PoE wieder ein, erst dann raus.
-            RunInShell(shell, "system-view",        line => Log(line, Level.Info));
-            RunInShell(shell, $"interface {port}",  line => Log(line, Level.Info));
-            RunInShell(shell, "undo poe enable",    line => Log(line, Level.Info));
+            RunInShell(shell, "system-view",            line => Log($"[{entry.Name}] {line}", Level.Info));
+            RunInShell(shell, $"interface {entry.PoEPort}", line => Log($"[{entry.Name}] {line}", Level.Info));
+            RunInShell(shell, "undo poe enable",        line => Log($"[{entry.Name}] {line}", Level.Info));
 
-            Log($"PoE deaktiviert an {port} – warte {poeOff}s (Sitzung bleibt offen) …", Level.Action);
-            Thread.Sleep(poeOff * 1000);
+            Log($"[{entry.Name}] PoE deaktiviert an {entry.PoEPort} – warte {entry.PoEOff}s (Sitzung bleibt offen) …", Level.Action);
+            Thread.Sleep(entry.PoEOff * 1000);
 
-            RunInShell(shell, "poe enable",         line => Log(line, Level.Info));
-            RunInShell(shell, "quit",               line => Log(line, Level.Info));
-            RunInShell(shell, "quit",               line => Log(line, Level.Info));
+            RunInShell(shell, "poe enable",             line => Log($"[{entry.Name}] {line}", Level.Info));
+            RunInShell(shell, "quit",                   line => Log($"[{entry.Name}] {line}", Level.Info));
+            RunInShell(shell, "quit",                   line => Log($"[{entry.Name}] {line}", Level.Info));
 
-            Log($"PoE wieder aktiviert an {port}.", Level.Ok);
+            Log($"[{entry.Name}] PoE wieder aktiviert an {entry.PoEPort}.", Level.Ok);
             client.Disconnect();
-            Log("SSH-Verbindung getrennt.", Level.Info);
+            Log($"[{entry.Name}] SSH-Verbindung getrennt.", Level.Info);
         }
         catch (Exception ex)
         {
-            Log($"SSH-Fehler: [{ex.GetType().Name}] {ex.Message}" +
+            Log($"[{entry.Name}] SSH-Fehler: [{ex.GetType().Name}] {ex.Message}" +
                 (ex.InnerException != null ? $"  ←  {ex.InnerException.GetType().Name}: {ex.InnerException.Message}" : ""),
                 Level.Error);
         }
     }
 
     // Führt einen einzelnen Befehl in einer bereits offenen Shell-Sitzung aus.
+    // Loggt standardmäßig nur eine knappe Zeile pro Befehl – die volle, mehrzeilige
+    // Switch-Antwort (Banner/Echo) wird nur bei verdächtigen/Error-Ausgaben mitgeschrieben,
+    // damit das Protokoll bei jedem PoE-Reset nicht unnötig aufgebläht wird.
     static void RunInShell(Renci.SshNet.ShellStream shell, string cmd, Action<string> onCommandLogged)
     {
         shell.WriteLine(cmd);
         Thread.Sleep(700); // Switch Zeit geben, den Befehl zu verarbeiten und zu antworten
         string chunk = shell.Read();
-        onCommandLogged($"  $ {cmd}\n{chunk.TrimEnd()}");
+
+        bool looksLikeError = chunk.IndexOf("Error", StringComparison.OrdinalIgnoreCase) >= 0
+                            || chunk.IndexOf("% ", StringComparison.Ordinal) >= 0
+                            || chunk.IndexOf("Unrecognized", StringComparison.OrdinalIgnoreCase) >= 0
+                            || chunk.IndexOf("Wrong", StringComparison.OrdinalIgnoreCase) >= 0;
+
+        onCommandLogged(looksLikeError
+            ? $"  $ {cmd}\n{chunk.TrimEnd()}"   // verdächtig → volle Ausgabe für die Diagnose
+            : $"  $ {cmd}  ✓");                  // normal → eine knappe Zeile
     }
 
     // Führt mehrere Befehle in EINER durchgehenden VRP-CLI-Sitzung aus.
@@ -527,46 +806,34 @@ public class MainForm : Form
     // nur innerhalb derselben Shell-Session – separate RunCommand-Aufrufe
     // (=> separate Sessions) verlieren diesen Kontext und werden vom Switch
     // teils sofort wieder getrennt.
-    string RunSequenceInShell(SshClient client, IEnumerable<string> commands, Action<string> onCommandLogged)
+    static void RunSequenceInShell(SshClient client, IEnumerable<string> commands, Action<string> onCommandLogged)
     {
-        var fullLog = new StringBuilder();
         using var shell = client.CreateShellStream("vt100", 200, 50, 800, 600, 4096);
 
-        // Login-Banner / erstes Prompt abwarten
         Thread.Sleep(500);
-        fullLog.Append(shell.Read());
+        shell.Read(); // Login-Banner / erstes Prompt verwerfen
 
         foreach (var cmd in commands)
-        {
-            shell.WriteLine(cmd);
-            Thread.Sleep(700); // Switch Zeit geben, den Befehl zu verarbeiten und zu antworten
-            string chunk = shell.Read();
-            fullLog.Append(chunk);
-            onCommandLogged($"  $ {cmd}\n{chunk.TrimEnd()}");
-        }
-
-        return fullLog.ToString();
+            RunInShell(shell, cmd, onCommandLogged);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  MANUELLE AKTIONEN  –  per Button ausgelöste Einzel-Befehle
+    //  MANUELLE AKTIONEN  –  per Button ausgelöste Einzel-Befehle für den im
+    //  Dropdown ausgewählten Eintrag
     // ─────────────────────────────────────────────────────────────────────────
-    async Task ManualAction(string label, string[] commands)
+    async Task ManualAction(WatchEntry entry, string label, string[] commands)
     {
-        if (string.IsNullOrWhiteSpace(txtSwitchIP.Text) ||
-            string.IsNullOrWhiteSpace(txtUser.Text)      ||
-            string.IsNullOrWhiteSpace(txtPoEPort.Text))
+        if (string.IsNullOrWhiteSpace(entry.SwitchIP) ||
+            string.IsNullOrWhiteSpace(entry.User)     ||
+            string.IsNullOrWhiteSpace(entry.PoEPort))
         {
-            MessageBox.Show("Bitte Switch IP, Benutzer und PoE Port ausfüllen.",
+            MessageBox.Show("Switch IP, Benutzer und PoE Port müssen für diese Überwachung gesetzt sein.",
                 "Fehlende Eingabe", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
-        string swIP = txtSwitchIP.Text.Trim();
-        string user = txtUser.Text.Trim();
-        string pass = txtPassword.Text;
-
-        Log($"▶ Manuelle Aktion: {label} …", Level.Action);
+        string swIP = entry.SwitchIP, user = entry.User, pass = entry.Password, name = entry.Name;
+        Log($"[{name}] ▶ Manuelle Aktion: {label} …", Level.Action);
 
         await Task.Run(() =>
         {
@@ -574,21 +841,20 @@ public class MainForm : Form
             try
             {
                 var auth = new PasswordAuthenticationMethod(user, pass);
-                var conn = new ConnectionInfo(swIP, user, auth)
-                           { Timeout = TimeSpan.FromSeconds(10) };
+                var conn = new ConnectionInfo(swIP, user, auth) { Timeout = TimeSpan.FromSeconds(10) };
 
                 client = new SshClient(conn);
                 client.Connect();
-                Log($"SSH verbunden mit {swIP}", Level.Info);
+                Log($"[{name}] SSH verbunden mit {swIP}", Level.Info);
 
-                RunSequenceInShell(client, commands, line => Log(line, Level.Info));
+                RunSequenceInShell(client, commands, line => Log($"[{name}] {line}", Level.Info));
 
                 client.Disconnect();
-                Log($"✔ {label} abgeschlossen.", Level.Ok);
+                Log($"[{name}] ✔ {label} abgeschlossen.", Level.Ok);
             }
             catch (Exception ex)
             {
-                Log($"SSH-Fehler bei „{label}“: [{ex.GetType().Name}] {ex.Message}" +
+                Log($"[{name}] SSH-Fehler bei „{label}“: [{ex.GetType().Name}] {ex.Message}" +
                     (ex.InnerException != null ? $"  ←  {ex.InnerException.GetType().Name}: {ex.InnerException.Message}" : ""),
                     Level.Error);
             }
@@ -603,11 +869,30 @@ public class MainForm : Form
     //  LOG & UI HELPER
     // ─────────────────────────────────────────────────────────────────────────
     enum Level { Info, Ok, Warn, Action, Error }
-    enum DotColor { Gray, Green, Yellow, Purple, Red }
 
     void Log(string msg, Level lv)
     {
         if (rtbLog.InvokeRequired) { rtbLog.Invoke(() => Log(msg, lv)); return; }
+
+        // Filter prüfen – Datei immer vollständig schreiben, nur UI-Anzeige filtern
+        bool show = _logFilter switch {
+            1 => lv == Level.Error || lv == Level.Warn,
+            2 => lv == Level.Action || msg.Contains("Reset") || msg.Contains("reset"),
+            3 => msg.Contains("💓"),
+            _ => true
+        };
+
+        WriteToLogFile(DateTime.Now.ToString("HH:mm:ss"), lv, msg);
+
+        if (!show) return;
+
+        // RAM-Begrenzung: alten Text im UI-Steuerelement kappen, Datei bleibt vollständig.
+        if (rtbLog.TextLength > MaxLogTextChars)
+        {
+            string text = rtbLog.Text;
+            int cut = text.IndexOf('\n', text.Length / 4);
+            if (cut > 0) rtbLog.Text = text.Substring(cut + 1);
+        }
 
         Color c = lv switch {
             Level.Ok     => Color.FromArgb(80,  200, 120),
@@ -625,8 +910,6 @@ public class MainForm : Form
         rtbLog.SelectionColor  = c;
         rtbLog.AppendText(msg + "\n");
         rtbLog.ScrollToCaret();
-
-        WriteToLogFile(ts, lv, msg);
     }
 
     static void WriteToLogFile(string ts, Level lv, string msg)
@@ -667,76 +950,43 @@ public class MainForm : Form
         }
     }
 
-    void SetDot(DotColor dc, string text)
+    void UpdateEntryStatus(WatchEntry entry, string status, Color color)
     {
-        if (InvokeRequired) { Invoke(() => SetDot(dc, text)); return; }
-        (_dotColor, lblStatus.ForeColor, lblStatus.Text) = dc switch {
-            DotColor.Green  => (Color.FromArgb(80,  200, 120), Color.FromArgb(80,  200, 120), text),
-            DotColor.Yellow => (Color.FromArgb(255, 200,   0), Color.FromArgb(255, 200,   0), text),
-            DotColor.Purple => (Color.FromArgb(190,  90, 255), Color.FromArgb(190,  90, 255), text),
-            DotColor.Red    => (Color.FromArgb(255,  70,  70), Color.FromArgb(255,  70,  70), text),
-            _               => (Color.Gray,                    Color.Silver,                  text)
-        };
-        pnlDot.Invalidate();
-    }
+        entry.Status = status;
+        if (rtbLog.InvokeRequired) { rtbLog.Invoke(() => UpdateEntryStatus(entry, status, color)); return; }
 
-    void SetUI(bool running)
-    {
-        if (InvokeRequired) { Invoke(() => SetUI(running)); return; }
-        btnStart.Enabled = !running;
-        btnStop.Enabled  =  running;
-        foreach (Control c in new Control[] {
-            txtMonitorIP, txtSwitchIP, txtUser, txtPassword,
-            txtPoEPort, numInterval, numRetries, numPoEOff })
-            c.Enabled = !running;
+        if (entry.Item != null && entry.Item.ListView != null)
+        {
+            entry.Item.SubItems[4].Text = entry.LastPing;
+            entry.Item.SubItems[5].Text = entry.TotalResets > 0 ? entry.TotalResets.ToString() : "–";
+            entry.Item.SubItems[6].Text = status;
+            entry.Item.ForeColor = color;
+        }
+        UpdateGlobalStatus();
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     //  UI-BUILDER HELFER
     // ─────────────────────────────────────────────────────────────────────────
-    static Panel MakePanel(int x, int y, int w, int h, Color bg)
-    {
-        var p = new Panel { Location = new Point(x, y), Size = new Size(w, h), BackColor = bg };
-        // wird nach Rückgabe dem Form hinzugefügt
-        return p;
-    }
+    static Panel MakePanel(int x, int y, int w, int h, Color bg) => new Panel {
+        Location = new Point(x, y), Size = new Size(w, h), BackColor = bg
+    };
 
     static void SectionLabel(Control p, string t, int x, int y) =>
         p.Controls.Add(new Label {
             Text = t, Location = new Point(x, y), AutoSize = true,
-            ForeColor = Color.FromArgb(0, 145, 255),
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold)
+            ForeColor = Color.FromArgb(0, 160, 220), Font = new Font("Segoe UI", 9.5f, FontStyle.Bold)
         });
 
-    static void Row(Control p, string label, ref int y)
+    static Button SmallBtn(string text, Color bg, int x, int y, int w)
     {
-        p.Controls.Add(new Label {
-            Text = label, Location = new Point(10, y + 3), AutoSize = true,
-            ForeColor = Color.FromArgb(175, 175, 175)
-        });
-        y += 28;
-    }
-
-    static TextBox Field(Control p, string def, int x, int y, int w)
-    {
-        var tb = new TextBox {
-            Text = def, Location = new Point(x, y), Width = w,
-            BackColor = Color.FromArgb(48, 48, 48),
-            ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle
+        var b = new Button {
+            Text = text, Location = new Point(x, y), Size = new Size(w, 26),
+            BackColor = bg, ForeColor = Color.White, FlatStyle = FlatStyle.Flat,
+            Font = new Font("Segoe UI", 8f), Cursor = Cursors.Hand
         };
-        p.Controls.Add(tb);
-        return tb;
-    }
-
-    static NumericUpDown Spin(Control p, int val, int min, int max, int x, int y, int w)
-    {
-        var n = new NumericUpDown {
-            Value = val, Minimum = min, Maximum = max,
-            Location = new Point(x, y), Width = w,
-            BackColor = Color.FromArgb(48, 48, 48), ForeColor = Color.White
-        };
-        p.Controls.Add(n);
-        return n;
+        b.FlatAppearance.BorderSize = 0;
+        return b;
     }
 
     static Button MakeActionBtn(string text, Color bg, int x, int y)
@@ -769,10 +1019,8 @@ public class MainForm : Form
                                    .FirstOrDefault();
 
             if (newest != null)
-                // Explorer mit markierter aktuellster Log-Datei öffnen
                 System.Diagnostics.Process.Start("explorer.exe", $"/select,\"{newest}\"");
             else
-                // Noch keine Logs vorhanden -> einfach den Ordner öffnen
                 System.Diagnostics.Process.Start("explorer.exe", $"\"{LogDir}\"");
         }
         catch (Exception ex)
@@ -784,30 +1032,26 @@ public class MainForm : Form
     // ─────────────────────────────────────────────────────────────────────────
     //  EINSTELLUNGEN  –  speichern / laden unter %AppData%\PoEWatchdog
     // ─────────────────────────────────────────────────────────────────────────
+    class AppSettingsV2
+    {
+        public List<WatchEntry> Entries { get; set; } = new();
+        public bool AutoStartAll { get; set; }
+    }
+
     void SaveSettings()
     {
         try
         {
-            var s = new AppSettings
-            {
-                MonitorIP   = txtMonitorIP.Text.Trim(),
-                SwitchIP    = txtSwitchIP.Text.Trim(),
-                User        = txtUser.Text.Trim(),
-                PoEPort     = txtPoEPort.Text.Trim(),
-                Interval    = (int)numInterval.Value,
-                Retries     = (int)numRetries.Value,
-                PoEOff      = (int)numPoEOff.Value,
-                SavePass    = chkSavePass.Checked,
-                Password    = chkSavePass.Checked ? Protect(txtPassword.Text) : "",
-                AutoStartWatchdog = chkAutoStartWatchdog.Checked
-            };
+            foreach (var en in entries)
+                en.PasswordEncrypted = en.SavePassword ? Protect(en.Password) : "";
+
+            var s = new AppSettingsV2 { Entries = entries.ToList(), AutoStartAll = chkAutoStartAll.Checked };
 
             Directory.CreateDirectory(SettingsDir);
             File.WriteAllText(SettingsPath, JsonSerializer.Serialize(s));
         }
         catch (Exception ex)
         {
-            // Beim Schließen nur best-effort, keine Dialoge mehr anzeigen
             try { WriteToLogFile(DateTime.Now.ToString("HH:mm:ss"), Level.Error, $"Einstellungen konnten nicht gespeichert werden: {ex.Message}"); } catch { }
         }
     }
@@ -819,22 +1063,20 @@ public class MainForm : Form
             chkAutoStartWin.Checked = IsAutoStartWithWindowsEnabled();
 
             if (!File.Exists(SettingsPath)) return;
-            var s = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SettingsPath));
+            var s = JsonSerializer.Deserialize<AppSettingsV2>(File.ReadAllText(SettingsPath));
             if (s == null) return;
 
-            txtMonitorIP.Text = s.MonitorIP ?? "";
-            txtSwitchIP.Text  = s.SwitchIP  ?? "";
-            txtUser.Text      = s.User      ?? "";
-            txtPoEPort.Text   = s.PoEPort   ?? "";
-            if (s.Interval > 0) numInterval.Value = Math.Min(numInterval.Maximum, Math.Max(numInterval.Minimum, s.Interval));
-            if (s.Retries  > 0) numRetries.Value  = Math.Min(numRetries.Maximum,  Math.Max(numRetries.Minimum,  s.Retries));
-            if (s.PoEOff   > 0) numPoEOff.Value   = Math.Min(numPoEOff.Maximum,   Math.Max(numPoEOff.Minimum,   s.PoEOff));
+            entries.Clear();
+            foreach (var en in s.Entries)
+            {
+                if (en.SavePassword && !string.IsNullOrEmpty(en.PasswordEncrypted))
+                    en.Password = Unprotect(en.PasswordEncrypted);
+                entries.Add(en);
+            }
 
-            chkSavePass.Checked = s.SavePass;
-            if (s.SavePass && !string.IsNullOrEmpty(s.Password))
-                txtPassword.Text = Unprotect(s.Password);
-
-            chkAutoStartWatchdog.Checked = s.AutoStartWatchdog;
+            chkAutoStartAll.Checked = s.AutoStartAll;
+            RefreshListView();
+            RefreshCombo();
         }
         catch (Exception ex)
         {
@@ -881,7 +1123,6 @@ public class MainForm : Form
         }
     }
 
-
     // Leichter Schutz für das gespeicherte Passwort (kein Klartext auf der Platte).
     // Hinweis: DPAPI ist an den Windows-Benutzer/-Rechner gebunden – kein Ersatz
     // für einen echten Secret-Store, aber besser als Klartext.
@@ -905,20 +1146,245 @@ public class MainForm : Form
         }
         catch { return ""; }
     }
-
-    class AppSettings
-    {
-        public string MonitorIP { get; set; } = "";
-        public string SwitchIP  { get; set; } = "";
-        public string User      { get; set; } = "";
-        public string PoEPort   { get; set; } = "";
-        public int    Interval  { get; set; }
-        public int    Retries   { get; set; }
-        public int    PoEOff    { get; set; }
-        public bool   SavePass  { get; set; }
-        public string Password  { get; set; } = "";
-        public bool   AutoStartWatchdog { get; set; }
-    }
-
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Dialog: eine Überwachung hinzufügen / bearbeiten
+// ─────────────────────────────────────────────────────────────────────────────
+public class EntryEditDialog : Form
+{
+    public WatchEntry Result = new();
+    private readonly WatchEntry? _existing;
+
+    TextBox txtName = new(), txtMonitor = new(), txtSwitch = new(),
+            txtUser  = new(), txtPass   = new(), txtPort   = new();
+    NumericUpDown numInterval = new(), numRetries = new(), numPoEOff = new(),
+                  numMaxResets = new(), numPostReset = new();
+    CheckBox chkSavePass = new();
+    Label lblTestResult = new();
+
+    public EntryEditDialog(WatchEntry? existing)
+    {
+        _existing = existing;
+
+        Text            = existing == null ? "Überwachung hinzufügen" : "Überwachung bearbeiten";
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        StartPosition   = FormStartPosition.CenterParent;
+        MaximizeBox     = false;
+        MinimizeBox     = false;
+        ShowInTaskbar   = false;
+        BackColor       = Color.FromArgb(28, 28, 28);
+        ForeColor       = Color.White;
+        Font            = new Font("Segoe UI", 9f);
+
+        int y = 18;
+        AddRow("Name:",            ref y, out txtName,    existing?.Name      ?? "Neue Überwachung");
+        AddRow("Überwachte IP:",   ref y, out txtMonitor, existing?.MonitorIP ?? "192.168.1.100");
+        AddRow("Switch IP:",       ref y, out txtSwitch,  existing?.SwitchIP  ?? "192.168.1.1");
+        AddRow("SSH Benutzer:",    ref y, out txtUser,    existing?.User      ?? "admin");
+        AddRow("SSH Passwort:",    ref y, out txtPass,    existing != null && existing.SavePassword ? existing.Password : "");
+        txtPass.UseSystemPasswordChar = true;
+
+        // SSH-Test Button neben Passwortfeld
+        var btnTest = new Button {
+            Text = "Verbindung testen", Location = new Point(150, y), Size = new Size(130, 24),
+            BackColor = Color.FromArgb(40, 100, 160), ForeColor = Color.White,
+            FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 7.5f), Cursor = Cursors.Hand
+        };
+        btnTest.FlatAppearance.BorderSize = 0;
+
+        lblTestResult.AutoSize  = true;
+        lblTestResult.Location  = new Point(288, y + 4);
+        lblTestResult.ForeColor = Color.Silver;
+        lblTestResult.Font      = new Font("Segoe UI", 7.5f);
+        lblTestResult.Text      = "";
+        Controls.Add(lblTestResult);
+
+        btnTest.Click += async (_, _) => {
+            btnTest.Enabled = false;
+            lblTestResult.Text      = "Verbinde …";
+            lblTestResult.ForeColor = Color.Silver;
+            bool ok = await Task.Run(() => TestSshConnection(
+                txtSwitch.Text.Trim(), txtUser.Text.Trim(), txtPass.Text));
+            lblTestResult.Text      = ok ? "✔ OK" : "✘ Fehler";
+            lblTestResult.ForeColor = ok ? Color.FromArgb(80, 200, 120) : Color.FromArgb(255, 80, 80);
+            btnTest.Enabled = true;
+        };
+        Controls.Add(btnTest);
+        y += 30;
+
+        chkSavePass.Text      = "Passwort merken (verschlüsselt, DPAPI)";
+        chkSavePass.AutoSize  = true;
+        chkSavePass.ForeColor = Color.Silver;
+        chkSavePass.Font      = new Font("Segoe UI", 7.5f);
+        chkSavePass.Location  = new Point(150, y);
+        chkSavePass.Checked   = existing?.SavePassword ?? false;
+        Controls.Add(chkSavePass);
+        y += 26;
+
+        AddRow("PoE Port:", ref y, out txtPort, existing?.PoEPort ?? "GigabitEthernet0/0/5");
+
+        var sep = new Panel { Location = new Point(16, y + 2), Size = new Size(326, 1),
+                               BackColor = Color.FromArgb(65, 65, 65) };
+        Controls.Add(sep); y += 14;
+
+        AddSpinRow("Prüfintervall (s):",     ref y, out numInterval,  5,   300, existing?.Interval        ?? 30);
+        AddSpinRow("Fehlversuche:",          ref y, out numRetries,   1,    20, existing?.Retries          ?? 3);
+        AddSpinRow("PoE-Pause (s):",         ref y, out numPoEOff,    3,   120, existing?.PoEOff           ?? 10);
+        AddSpinRow("Max. Resets (0=∞):",     ref y, out numMaxResets, 0,    50, existing?.MaxResets        ?? 5);
+        AddSpinRow("Timeout nach Reset (s):", ref y, out numPostReset, 10, 600, existing?.PostResetTimeout ?? 120);
+
+        y += 12;
+        var btnOk = new Button {
+            Text = "Speichern", Location = new Point(60, y), Size = new Size(110, 36),
+            BackColor = Color.FromArgb(0, 120, 212), ForeColor = Color.White,
+            FlatStyle = FlatStyle.Flat, Cursor = Cursors.Hand
+        };
+        btnOk.FlatAppearance.BorderSize = 0;
+        btnOk.Click += (_, _) => {
+            if (!ValidateInput()) return;
+            BuildResult();
+            DialogResult = DialogResult.OK;
+            Close();
+        };
+
+        var btnCancel = new Button {
+            Text = "Abbrechen", Location = new Point(180, y), Size = new Size(110, 36),
+            BackColor = Color.FromArgb(70, 70, 70), ForeColor = Color.White,
+            FlatStyle = FlatStyle.Flat, Cursor = Cursors.Hand
+        };
+        btnCancel.FlatAppearance.BorderSize = 0;
+        btnCancel.Click += (_, _) => { DialogResult = DialogResult.Cancel; Close(); };
+
+        Controls.AddRange(new Control[] { btnOk, btnCancel });
+
+        ClientSize  = new Size(380, y + 60);
+        AcceptButton = btnOk;
+        CancelButton = btnCancel;
+    }
+
+    static bool TestSshConnection(string host, string user, string pass)
+    {
+        try
+        {
+            var auth = new PasswordAuthenticationMethod(user, pass);
+            var conn = new ConnectionInfo(host, user, auth) { Timeout = TimeSpan.FromSeconds(8) };
+            using var client = new SshClient(conn);
+            client.Connect();
+            bool ok = client.IsConnected;
+            client.Disconnect();
+            return ok;
+        }
+        catch { return false; }
+    }
+
+    void AddRow(string label, ref int y, out TextBox tb, string def)
+    {
+        Controls.Add(new Label {
+            Text = label, Location = new Point(16, y + 3), AutoSize = true,
+            ForeColor = Color.FromArgb(175, 175, 175)
+        });
+        tb = new TextBox {
+            Text = def, Location = new Point(150, y), Width = 196,
+            BackColor = Color.FromArgb(48, 48, 48), ForeColor = Color.White,
+            BorderStyle = BorderStyle.FixedSingle
+        };
+        Controls.Add(tb);
+        y += 30;
+    }
+
+    void AddSpinRow(string label, ref int y, out NumericUpDown n, int min, int max, int val)
+    {
+        Controls.Add(new Label {
+            Text = label, Location = new Point(16, y + 3), AutoSize = true,
+            ForeColor = Color.FromArgb(175, 175, 175)
+        });
+        n = new NumericUpDown {
+            Minimum = min, Maximum = max, Value = Math.Min(max, Math.Max(min, val)),
+            Location = new Point(150, y), Width = 90,
+            BackColor = Color.FromArgb(48, 48, 48), ForeColor = Color.White
+        };
+        Controls.Add(n);
+        y += 30;
+    }
+
+    bool ValidateInput()
+    {
+        if (string.IsNullOrWhiteSpace(txtName.Text)    || string.IsNullOrWhiteSpace(txtMonitor.Text) ||
+            string.IsNullOrWhiteSpace(txtSwitch.Text)   || string.IsNullOrWhiteSpace(txtUser.Text)    ||
+            string.IsNullOrWhiteSpace(txtPort.Text))
+        {
+            MessageBox.Show("Bitte alle Felder (außer Passwort) ausfüllen.",
+                "Fehlende Eingabe", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+        return true;
+    }
+
+    void BuildResult()
+    {
+        Result = _existing ?? new WatchEntry();
+        Result.Name             = txtName.Text.Trim();
+        Result.MonitorIP        = txtMonitor.Text.Trim();
+        Result.SwitchIP         = txtSwitch.Text.Trim();
+        Result.User             = txtUser.Text.Trim();
+        Result.PoEPort          = txtPort.Text.Trim();
+        Result.Interval         = (int)numInterval.Value;
+        Result.Retries          = (int)numRetries.Value;
+        Result.PoEOff           = (int)numPoEOff.Value;
+        Result.MaxResets        = (int)numMaxResets.Value;
+        Result.PostResetTimeout = (int)numPostReset.Value;
+        Result.SavePassword     = chkSavePass.Checked;
+        Result.Password         = txtPass.Text; // im Speicher immer verfügbar, damit der Watchdog laufen kann
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Kleiner Dialog: "Beenden" oder "In den Tray legen", erscheint beim Klick auf X
+// ─────────────────────────────────────────────────────────────────────────────
+public class CloseChoiceDialog : Form
+{
+    public bool GoToTray { get; private set; } = true;
+
+    public CloseChoiceDialog()
+    {
+        Text            = "PoE Watchdog";
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        StartPosition   = FormStartPosition.CenterParent;
+        MaximizeBox     = false;
+        MinimizeBox     = false;
+        ShowInTaskbar   = false;
+        Size            = new Size(360, 170);
+        BackColor       = Color.FromArgb(28, 28, 28);
+        ForeColor       = Color.White;
+        Font            = new Font("Segoe UI", 9f);
+
+        var lbl = new Label {
+            Text = "Was möchtest du tun?",
+            Location = new Point(20, 20), AutoSize = true,
+            Font = new Font("Segoe UI", 10f, FontStyle.Bold)
+        };
+
+        var lblSub = new Label {
+            Text = "Der Watchdog läuft im Hintergrund weiter,\nwenn du ihn in den Tray legst.",
+            Location = new Point(20, 48), AutoSize = true,
+            ForeColor = Color.FromArgb(170, 170, 170), Font = new Font("Segoe UI", 8.5f)
+        };
+
+        var btnTray = MakeBtn("In den Tray legen", Color.FromArgb(0, 122, 204), 20, 95);
+        btnTray.Click += (_, _) => { GoToTray = true;  DialogResult = DialogResult.OK; Close(); };
+
+        var btnExit = MakeBtn("Beenden", Color.FromArgb(70, 70, 70), 180, 95);
+        btnExit.Click += (_, _) => { GoToTray = false; DialogResult = DialogResult.OK; Close(); };
+
+        Controls.AddRange(new Control[] { lbl, lblSub, btnTray, btnExit });
+        AcceptButton = btnTray;
+        CancelButton = null;
+    }
+
+    static Button MakeBtn(string text, Color bg, int x, int y) => new Button {
+        Text = text, Location = new Point(x, y), Size = new Size(160, 38),
+        BackColor = bg, ForeColor = Color.White, FlatStyle = FlatStyle.Flat,
+        Font = new Font("Segoe UI", 9f, FontStyle.Bold), Cursor = Cursors.Hand
+    };
+}
