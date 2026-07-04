@@ -41,6 +41,7 @@ public class WatchEntry
     public int    PoEOff           { get; set; } = 10;
     public int    MaxResets        { get; set; } = 5;    // 0 = unbegrenzt
     public int    PostResetTimeout { get; set; } = 120;  // Sekunden auf Wiederherstellung warten
+    public int    ResetWindowMinutes { get; set; } = 60; // Zeitfenster für MaxResets
     public int    TotalResets      { get; set; } = 0;   // persistent gespeichert
     public bool   SavePassword      { get; set; } = false;
     public string PasswordEncrypted { get; set; } = "";
@@ -49,7 +50,8 @@ public class WatchEntry
     [JsonIgnore] public string Password = "";
     [JsonIgnore] public CancellationTokenSource? Cts;
     [JsonIgnore] public int FailCount;
-    [JsonIgnore] public int ResetCount;      // Session-Zähler (seit letztem Start)
+    [JsonIgnore] public int ResetCount;      // Session-Zähler (nur für Anzeige/Heartbeat)
+    [JsonIgnore] public readonly List<DateTime> ResetTimestamps = new(); // für Zeitfenster-Prüfung
     [JsonIgnore] public string Status = "Gestoppt";
     [JsonIgnore] public string LastPing = "–";
     [JsonIgnore] public ListViewItem? Item;
@@ -116,7 +118,14 @@ public class MainForm : Form
     // Begrenzung der Log-Anzeige im UI, damit der RAM-Verbrauch über lange
     // Laufzeiten nicht unbegrenzt wächst (die Datei auf der Platte bleibt vollständig).
     const int MaxLogTextChars = 300_000;
+    const int MaxLogBuffer    = 2000; // max. Einträge im Puffer für Filter-Neubau
+
     int _logFilter = 0; // 0=Alle, 1=Fehler, 2=Resets, 3=Heartbeat
+
+    // Puffer: alle letzten Einträge im Speicher halten, damit der Filter
+    // den RichTextBox jederzeit vollständig neu aufbauen kann.
+    record LogEntry(string Ts, string Msg, Level Lv);
+    readonly List<LogEntry> _logBuffer = new();
 
     // ═════════════════════════════════════════════════════════════════════════
     public MainForm(bool startedMinimized = false)
@@ -252,8 +261,8 @@ public class MainForm : Form
     {
         // Fenster
         Text            = "Huawei PoE Watchdog";
-        Size            = new Size(680, 780);
-        MinimumSize     = new Size(680, 780);
+        Size            = new Size(680, 800);
+        MinimumSize     = new Size(680, 800);
         BackColor       = Color.FromArgb(28, 28, 28);
         ForeColor       = Color.White;
         Font            = new Font("Segoe UI", 9f);
@@ -397,19 +406,19 @@ public class MainForm : Form
         manual.Controls.AddRange(new Control[] { cmbTarget, btnPoEOff, btnPoEOn, btnIfDown, btnIfUp });
 
         // ── Log ───────────────────────────────────────────────────────────
-        var logBox = MakePanel(12, 442, 648, 288, Color.FromArgb(38, 38, 38));
+        var logBox = MakePanel(12, 442, 648, 308, Color.FromArgb(38, 38, 38));
         SectionLabel(logBox, "📋  Protokoll", 10, 8);
 
-        // Filter-Buttons
-        string[] filterLabels = { "Alle", "⚠ Fehler", "⚡ Resets", "💓 Heartbeat" };
+        // Filter-Buttons – zweite Zeile unter dem SectionLabel
+        string[] filterLabels = { "✕ Alle anzeigen", "⚠ Fehler", "⚡ Resets", "💓 Heartbeat" };
         var filterBtns = new Button[filterLabels.Length];
         for (int i = 0; i < filterLabels.Length; i++)
         {
             int idx = i;
             filterBtns[i] = new Button {
                 Text = filterLabels[i],
-                Location = new Point(10 + idx * 86, 5),
-                Size = new Size(82, 22),
+                Location = new Point(10 + idx * 90, 28),
+                Size = new Size(86, 22),
                 BackColor = idx == 0 ? Color.FromArgb(0, 110, 190) : Color.FromArgb(48, 48, 48),
                 ForeColor = Color.White, FlatStyle = FlatStyle.Flat,
                 Font = new Font("Segoe UI", 7.5f), Cursor = Cursors.Hand,
@@ -420,13 +429,13 @@ public class MainForm : Form
                 foreach (var fb in filterBtns)
                     fb.BackColor = Color.FromArgb(48, 48, 48);
                 ((Button)s!).BackColor = Color.FromArgb(0, 110, 190);
-                _logFilter = (int)((Button)s!).Tag!;
+                ApplyFilter((int)((Button)s!).Tag!);
             };
             logBox.Controls.Add(filterBtns[i]);
         }
 
         var btnOpenLog = new Button {
-            Text = "Log öffnen", Location = new Point(498, 5), Size = new Size(72, 22),
+            Text = "Log öffnen", Location = new Point(498, 28), Size = new Size(72, 22),
             BackColor = Color.FromArgb(58, 58, 58), ForeColor = Color.Silver,
             FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 7.5f), Cursor = Cursors.Hand
         };
@@ -434,14 +443,14 @@ public class MainForm : Form
         btnOpenLog.Click += (_, _) => OpenLogFile();
 
         var btnClear = new Button {
-            Text = "Leeren", Location = new Point(576, 5), Size = new Size(62, 22),
+            Text = "Leeren", Location = new Point(576, 28), Size = new Size(62, 22),
             BackColor = Color.FromArgb(58, 58, 58), ForeColor = Color.Silver,
             FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 7.5f), Cursor = Cursors.Hand
         };
         btnClear.FlatAppearance.BorderSize = 0;
         btnClear.Click += (_, _) => rtbLog.Clear();
 
-        rtbLog.Location    = new Point(8, 30);
+        rtbLog.Location    = new Point(8, 55);
         rtbLog.Size        = new Size(630, 246);
         rtbLog.BackColor   = Color.FromArgb(18, 18, 18);
         rtbLog.ForeColor   = Color.FromArgb(200, 200, 200);
@@ -578,6 +587,8 @@ public class MainForm : Form
 
         entry.Cts       = new CancellationTokenSource();
         entry.FailCount = 0;
+        entry.ResetCount = 0;
+        entry.ResetTimestamps.Clear();
         UpdateEntryStatus(entry, "Läuft", Color.FromArgb(80, 200, 120));
         Log($"[{entry.Name}] Watchdog gestartet  ▸  Monitor: {entry.MonitorIP}  |  Switch: {entry.SwitchIP}  |  Port: {entry.PoEPort}", Level.Info);
 
@@ -655,18 +666,25 @@ public class MainForm : Form
 
                     if (entry.FailCount >= entry.Retries)
                     {
+                        // ── Zeitfenster-Prüfung ───────────────────────────────────────
+                        // Alte Zeitstempel außerhalb des Fensters entfernen
+                        var windowStart = DateTime.Now.AddMinutes(-entry.ResetWindowMinutes);
+                        entry.ResetTimestamps.RemoveAll(t => t < windowStart);
+
                         // MaxResets-Grenze prüfen (0 = unbegrenzt)
-                        if (entry.MaxResets > 0 && entry.ResetCount >= entry.MaxResets)
+                        if (entry.MaxResets > 0 && entry.ResetTimestamps.Count >= entry.MaxResets)
                         {
-                            Log($"[{entry.Name}] 🛑 Maximale Anzahl Resets ({entry.MaxResets}) erreicht – Watchdog wird gestoppt. Bitte manuell prüfen!", Level.Error);
+                            Log($"[{entry.Name}] 🛑 {entry.MaxResets} Resets innerhalb von {entry.ResetWindowMinutes} Minuten – Watchdog wird gestoppt. Bitte manuell prüfen!", Level.Error);
                             trayIcon.ShowBalloonTip(5000, "PoE Watchdog – Kritisch",
-                                $"[{entry.Name}] Max. Resets erreicht – Überwachung gestoppt!", ToolTipIcon.Error);
-                            break; // Watchdog für diesen Eintrag beenden
+                                $"[{entry.Name}] Zu viele Resets in kurzer Zeit – Überwachung gestoppt!", ToolTipIcon.Error);
+                            break;
                         }
 
+                        // Reset durchführen und Zeitstempel merken
+                        entry.ResetTimestamps.Add(DateTime.Now);
                         entry.ResetCount++;
                         entry.TotalResets++;
-                        SaveSettings(); // TotalResets persistieren
+                        SaveSettings();
 
                         Log($"[{entry.Name}] ⚡ Schwellwert erreicht – PoE-Reset #{entry.ResetCount} (gesamt: {entry.TotalResets}) wird ausgeführt …", Level.Action);
                         UpdateEntryStatus(entry, $"PoE-Reset #{entry.ResetCount} …", Color.FromArgb(190, 90, 255));
@@ -691,6 +709,7 @@ public class MainForm : Form
                             {
                                 entry.LastPing = DateTime.Now.ToString("HH:mm:ss");
                                 recovered = true;
+                                entry.ResetCount = 0; // Zähler zurück – Gerät ist wieder OK
                                 Log($"[{entry.Name}] ✔ Gerät nach {waited}s wieder erreichbar.", Level.Ok);
                                 trayIcon.ShowBalloonTip(3000, "PoE Watchdog – OK",
                                     $"[{entry.Name}] Gerät nach Reset wiederhergestellt.", ToolTipIcon.Info);
@@ -874,19 +893,47 @@ public class MainForm : Form
     {
         if (rtbLog.InvokeRequired) { rtbLog.Invoke(() => Log(msg, lv)); return; }
 
-        // Filter prüfen – Datei immer vollständig schreiben, nur UI-Anzeige filtern
-        bool show = _logFilter switch {
-            1 => lv == Level.Error || lv == Level.Warn,
-            2 => lv == Level.Action || msg.Contains("Reset") || msg.Contains("reset"),
-            3 => msg.Contains("💓"),
-            _ => true
-        };
+        string ts = DateTime.Now.ToString("HH:mm:ss");
+        WriteToLogFile(ts, lv, msg);
 
-        WriteToLogFile(DateTime.Now.ToString("HH:mm:ss"), lv, msg);
+        // In Puffer aufnehmen (RAM-begrenzt)
+        _logBuffer.Add(new LogEntry(ts, msg, lv));
+        if (_logBuffer.Count > MaxLogBuffer)
+            _logBuffer.RemoveAt(0);
 
-        if (!show) return;
+        // Nur anhängen wenn dieser Eintrag dem aktiven Filter entspricht
+        if (MatchesFilter(msg, lv))
+            AppendLogLine(ts, msg, lv);
+    }
 
-        // RAM-Begrenzung: alten Text im UI-Steuerelement kappen, Datei bleibt vollständig.
+    bool MatchesFilter(string msg, Level lv) => _logFilter switch {
+        1 => lv == Level.Error || lv == Level.Warn,
+        2 => lv == Level.Action || msg.Contains("Reset") || msg.Contains("reset"),
+        3 => msg.Contains("💓"),
+        _ => true
+    };
+
+    void ApplyFilter(int filter)
+    {
+        _logFilter = filter;
+        if (rtbLog.InvokeRequired) { rtbLog.Invoke(() => RebuildLogView()); return; }
+        RebuildLogView();
+    }
+
+    void RebuildLogView()
+    {
+        rtbLog.SuspendLayout();
+        rtbLog.Clear();
+        foreach (var e in _logBuffer)
+            if (MatchesFilter(e.Msg, e.Lv))
+                AppendLogLine(e.Ts, e.Msg, e.Lv);
+        rtbLog.ScrollToCaret();
+        rtbLog.ResumeLayout();
+    }
+
+    void AppendLogLine(string ts, string msg, Level lv)
+    {
+        // RAM-Begrenzung für das UI-Steuerelement
         if (rtbLog.TextLength > MaxLogTextChars)
         {
             string text = rtbLog.Text;
@@ -901,7 +948,6 @@ public class MainForm : Form
             Level.Error  => Color.FromArgb(255,  70,  70),
             _            => Color.FromArgb(155, 155, 155)
         };
-        string ts = DateTime.Now.ToString("HH:mm:ss");
 
         rtbLog.SelectionStart  = rtbLog.TextLength;
         rtbLog.SelectionLength = 0;
@@ -1056,6 +1102,21 @@ public class MainForm : Form
         }
     }
 
+    // Altes Format (vor Multi-Eintrag-Umbau) – nur für Migration
+    class AppSettingsLegacy
+    {
+        public string MonitorIP { get; set; } = "";
+        public string SwitchIP  { get; set; } = "";
+        public string User      { get; set; } = "";
+        public string PoEPort   { get; set; } = "";
+        public int    Interval  { get; set; }
+        public int    Retries   { get; set; }
+        public int    PoEOff    { get; set; }
+        public bool   SavePass  { get; set; }
+        public string Password  { get; set; } = "";
+        public bool   AutoStartWatchdog { get; set; }
+    }
+
     void LoadSettings()
     {
         try
@@ -1063,18 +1124,55 @@ public class MainForm : Form
             chkAutoStartWin.Checked = IsAutoStartWithWindowsEnabled();
 
             if (!File.Exists(SettingsPath)) return;
-            var s = JsonSerializer.Deserialize<AppSettingsV2>(File.ReadAllText(SettingsPath));
-            if (s == null) return;
 
-            entries.Clear();
-            foreach (var en in s.Entries)
+            string json = File.ReadAllText(SettingsPath);
+            var doc = JsonDocument.Parse(json);
+
+            // Migrations-Check: hat die JSON eine "Entries"-Liste? → neues Format
+            if (doc.RootElement.TryGetProperty("Entries", out _))
             {
-                if (en.SavePassword && !string.IsNullOrEmpty(en.PasswordEncrypted))
-                    en.Password = Unprotect(en.PasswordEncrypted);
-                entries.Add(en);
+                // ── Neues Format (AppSettingsV2) ──────────────────────────
+                var s = JsonSerializer.Deserialize<AppSettingsV2>(json);
+                if (s == null) return;
+
+                entries.Clear();
+                foreach (var en in s.Entries)
+                {
+                    if (en.SavePassword && !string.IsNullOrEmpty(en.PasswordEncrypted))
+                        en.Password = Unprotect(en.PasswordEncrypted);
+                    entries.Add(en);
+                }
+                chkAutoStartAll.Checked = s.AutoStartAll;
+            }
+            else
+            {
+                // ── Altes Format → migrieren ──────────────────────────────
+                var old = JsonSerializer.Deserialize<AppSettingsLegacy>(json);
+                if (old != null && !string.IsNullOrWhiteSpace(old.MonitorIP))
+                {
+                    var migrated = new WatchEntry {
+                        Name      = "Migriert",
+                        MonitorIP = old.MonitorIP,
+                        SwitchIP  = old.SwitchIP,
+                        User      = old.User,
+                        PoEPort   = old.PoEPort,
+                        Interval  = old.Interval > 0 ? old.Interval : 30,
+                        Retries   = old.Retries  > 0 ? old.Retries  : 3,
+                        PoEOff    = old.PoEOff   > 0 ? old.PoEOff   : 10,
+                        SavePassword = old.SavePass,
+                        PasswordEncrypted = old.Password
+                    };
+                    if (old.SavePass && !string.IsNullOrEmpty(old.Password))
+                        migrated.Password = Unprotect(old.Password);
+
+                    entries.Clear();
+                    entries.Add(migrated);
+                    chkAutoStartAll.Checked = old.AutoStartWatchdog;
+                    Log("Einstellungen aus altem Format migriert → Eintrag 'Migriert' angelegt.", Level.Ok);
+                    SaveSettings(); // direkt im neuen Format abspeichern
+                }
             }
 
-            chkAutoStartAll.Checked = s.AutoStartAll;
             RefreshListView();
             RefreshCombo();
         }
@@ -1159,7 +1257,7 @@ public class EntryEditDialog : Form
     TextBox txtName = new(), txtMonitor = new(), txtSwitch = new(),
             txtUser  = new(), txtPass   = new(), txtPort   = new();
     NumericUpDown numInterval = new(), numRetries = new(), numPoEOff = new(),
-                  numMaxResets = new(), numPostReset = new();
+                  numMaxResets = new(), numPostReset = new(), numResetWindow = new();
     CheckBox chkSavePass = new();
     Label lblTestResult = new();
 
@@ -1228,11 +1326,12 @@ public class EntryEditDialog : Form
                                BackColor = Color.FromArgb(65, 65, 65) };
         Controls.Add(sep); y += 14;
 
-        AddSpinRow("Prüfintervall (s):",     ref y, out numInterval,  5,   300, existing?.Interval        ?? 30);
-        AddSpinRow("Fehlversuche:",          ref y, out numRetries,   1,    20, existing?.Retries          ?? 3);
-        AddSpinRow("PoE-Pause (s):",         ref y, out numPoEOff,    3,   120, existing?.PoEOff           ?? 10);
-        AddSpinRow("Max. Resets (0=∞):",     ref y, out numMaxResets, 0,    50, existing?.MaxResets        ?? 5);
-        AddSpinRow("Timeout nach Reset (s):", ref y, out numPostReset, 10, 600, existing?.PostResetTimeout ?? 120);
+        AddSpinRow("Prüfintervall (s):",         ref y, out numInterval,    5,   300, existing?.Interval           ?? 30);
+        AddSpinRow("Fehlversuche:",               ref y, out numRetries,     1,    20, existing?.Retries             ?? 3);
+        AddSpinRow("PoE-Pause (s):",              ref y, out numPoEOff,      3,   120, existing?.PoEOff              ?? 10);
+        AddSpinRow("Max. Resets (0=∞):",          ref y, out numMaxResets,   0,    50, existing?.MaxResets           ?? 5);
+        AddSpinRow("Reset-Fenster (min):",        ref y, out numResetWindow, 5,  1440, existing?.ResetWindowMinutes  ?? 60);
+        AddSpinRow("Timeout nach Reset (s):",     ref y, out numPostReset,  10,   600, existing?.PostResetTimeout    ?? 120);
 
         y += 12;
         var btnOk = new Button {
@@ -1332,8 +1431,9 @@ public class EntryEditDialog : Form
         Result.Interval         = (int)numInterval.Value;
         Result.Retries          = (int)numRetries.Value;
         Result.PoEOff           = (int)numPoEOff.Value;
-        Result.MaxResets        = (int)numMaxResets.Value;
-        Result.PostResetTimeout = (int)numPostReset.Value;
+        Result.MaxResets           = (int)numMaxResets.Value;
+        Result.ResetWindowMinutes  = (int)numResetWindow.Value;
+        Result.PostResetTimeout    = (int)numPostReset.Value;
         Result.SavePassword     = chkSavePass.Checked;
         Result.Password         = txtPass.Text; // im Speicher immer verfügbar, damit der Watchdog laufen kann
     }

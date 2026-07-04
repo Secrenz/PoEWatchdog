@@ -22,7 +22,7 @@
     <PublishReadyToRun>false</PublishReadyToRun>
     <!-- Keine zusätzliche .pdb neben der exe veröffentlichen -->
     <DebugType>none</DebugType>
-	<VersionPrefix>1.2.1</VersionPrefix>
+	<VersionPrefix>1.2.2</VersionPrefix>
   </PropertyGroup>
 
   <ItemGroup>
